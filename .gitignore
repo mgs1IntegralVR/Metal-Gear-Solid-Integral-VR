@@ -1,0 +1,34 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Build output
+Debug/
+Release/
+x64/
+Win32/
+build/
+build32/
+out/
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.obj
+*.iobj
+*.ipdb
+*.tlog
+*.log
+
+# Archives and scratch
+*.zip
+*.7z
+*.BAK
+*.BAKBAK
+VR_SNAPSHOTS/

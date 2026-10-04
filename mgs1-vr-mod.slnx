@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="mgs1-vr-mod.vcxproj" Id="d78671d9-28a2-4090-9687-95549686726f" />
+</Solution>
