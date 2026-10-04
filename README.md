@@ -37,6 +37,13 @@ To uninstall, delete those three files and rename `dinput.dll.bak` back to `dinp
 
 Third-party code included: [MinHook](third-party/minhook/LICENSE.txt) (BSD 2-Clause) and the [OpenXR SDK headers](third-party/openxr/LICENSE) (Apache-2.0).
 
+
+## Credits
+
+The ongoing decompilation effort which was an incredible resource https://github.com/FoxdieTeam/mgs_reversing
+
+Shoutout to this dude where I discovered his kindly uploaded Cheat Tables. Not only did this make the Life and Radar flags for the wrists possible, but the cutscene camera control from Snake's point of view also: https://www.youtube.com/watch?v=bhxIyGz_1OI
+
 ## Legal
 
 This project contains no game code or assets. You must own Metal Gear Solid on GOG. Metal Gear Solid is a trademark of Konami; this project is not affiliated with or endorsed by Konami or GOG.
