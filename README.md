@@ -42,7 +42,7 @@ Third-party code included: [MinHook](third-party/minhook/LICENSE.txt) (BSD 2-Cla
 
 The ongoing decompilation effort which was an incredible resource https://github.com/FoxdieTeam/mgs_reversing
 
-Shoutout to this dude where I discovered his kindly uploaded Cheat Tables. Not only did this make the Life and Radar flags for the wrists possible, but the cutscene camera control form Snake's point of view also: https://www.youtube.com/watch?v=bhxIyGz_1OI
+Shoutout to this dude where I discovered his kindly uploaded Cheat Tables. Not only did this make the Life and Radar flags for the wrists possible, but the cutscene camera control from Snake's point of view also: https://www.youtube.com/watch?v=bhxIyGz_1OI
 
 ## Legal
 
