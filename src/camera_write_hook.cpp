@@ -462,6 +462,19 @@ int   g_gpPov = 1;                // gameplay_pov: 0 off, 1 on
 int   g_gpPovForward = 80;        // eye pushed this far in front of the head joint
 int   g_gpPovVehBack = 250;       // in a vehicle (jeep gun): eye this far BEHIND the head ...
 int   g_gpPovVehUp = 120;         // ... and this far above it, so the gun is not in your face
+// Rappel (2026-10-04): on the rope Snake is not sna_init at all -- he is
+// chara\rope\rope.c, a separate task with its own copy of his model. Found the
+// same way as a vehicle, but the eye sits at his head like on foot.
+int   g_gpPovRope = 1;            // gameplay_pov_rope: 0 off, 1 Snake's eyes on the rope
+int   g_gpPovRopeForward = 40;    // gameplay_pov_rope_forward_units: eye in front of the head (face is near the wall)
+// Ocelot's torture room (2026-10-04): strapped to the rack Snake is not
+// sna_init either -- he is chara\torture\torture.c (0x904 bytes, ctor 4F5B03),
+// and in the cell sne_03c.c (0x800). Same story as the rope: no live
+// sna_init, so Snake's eyes stood down ("no live player object") and the
+// game's own camera showed the whole torture and the scripted shots around it.
+int   g_gpPovTorture = 1;           // gameplay_pov_torture: 0 off, 1 Snake's eyes on the rack / in the cell
+int   g_gpPovTortureForward = 80;   // gameplay_pov_torture_forward_units: eye in front of the head
+int   g_gpPovTortureYawOffsetDeg = 0; // gameplay_pov_torture_yaw_offset_deg: added to his body facing (180 if you start facing backwards)
 bool  g_gpPovFollowBody = true;   // the view turns when Snake turns (ladder, elevator)
 bool  g_gpPovHideBody = true;     // hide Snake's own body for the renderer, like first person
 bool  g_gpPovFov = true;          // use the mod's lens (fov_clip_distance)
@@ -482,7 +495,7 @@ int   g_gpPovStickFollowsView = 1;  // gameplay_pov_stick_follows_view: 0 off, 1
 // stale spot (the "under the map" view), so the POV keeps the vehicle even
 // when the game's FPV flag goes up, and first-person maintenance waits.
 std::atomic<unsigned long long> g_gpPovVehicleTick{ 0 };
-std::atomic<int> g_gpPovVehicleKind{ 0 };   // 1 jeep / tank / other, 2 REX top (snake18)
+std::atomic<int> g_gpPovVehicleKind{ 0 };   // 1 jeep / tank / other, 2 REX top (snake18), 3 rappel rope (rope.c), 4 torture rack / cell (torture\\*.c)
 // Round 10: the hands on top of REX need the view Snake's eyes drew (layer 3
 // is the game's own camera again by the time the actors run) and the body.
 std::atomic<uint64_t> g_gpPovPairA{ 0 }, g_gpPovPairB{ 0 };   // FROM xyz + TO x / TO yz packed
@@ -1746,6 +1759,15 @@ void LoadCameraHookConfig() {
     g_gpPovFollowBody = I("gameplay_pov_follow_body", 1) != 0;
     g_gpPovVehBack = I("gameplay_pov_vehicle_back_units", 250);
     g_gpPovVehUp = I("gameplay_pov_vehicle_up_units", 120);
+    g_gpPovRope = I("gameplay_pov_rope", 1) != 0 ? 1 : 0;
+    g_gpPovRopeForward = I("gameplay_pov_rope_forward_units", 40);
+    if (g_gpPovRopeForward < 0) g_gpPovRopeForward = 0;
+    if (g_gpPovRopeForward > 600) g_gpPovRopeForward = 600;
+    g_gpPovTorture = I("gameplay_pov_torture", 1) != 0 ? 1 : 0;
+    g_gpPovTortureForward = I("gameplay_pov_torture_forward_units", 80);
+    if (g_gpPovTortureForward < 0) g_gpPovTortureForward = 0;
+    if (g_gpPovTortureForward > 600) g_gpPovTortureForward = 600;
+    g_gpPovTortureYawOffsetDeg = I("gameplay_pov_torture_yaw_offset_deg", 0);
     g_gpPovHideBody = I("gameplay_pov_hide_body", 1) != 0;
     g_gpPovFov = I("gameplay_pov_fov", 1) != 0;
     g_gpPovPosition = I("gameplay_pov_position", 1) != 0;
@@ -2797,6 +2819,7 @@ extern "C" void __cdecl Mgs1CameraRotWriteBody(uint32_t gameRollDword) {
         r.kPitch = g_invertHeadPitch ? -1 : 1;
         r.clip = 0;                        // filled at flip, from what was really used
         r.tick = GetTickCount64();
+        { LARGE_INTEGER q; QueryPerformanceCounter(&q); r.qpc = q.QuadPart; }
         AcquireSRWLockExclusive(&g_frameRecLock);
         g_frameRec = r;
         g_frameRecRun = g_rotHookRuns.load(std::memory_order_relaxed);
@@ -4353,7 +4376,14 @@ extern "C" void __cdecl Mgs1ViewCommitBody() {
     s_lastWrittenTo = written;
     s_haveLastWritten = wrote;
     g_vcDriving.store(wrote, std::memory_order_relaxed);
-    g_vcDroveThisBuild.store(wrote, std::memory_order_relaxed);
+    // OWNED, not "wrote" (2026-10-04, rappel log): on the frame this hook pins
+    // its reference it writes nothing, so the view-build hook (+53C5C, the same
+    // pair) took the frame under its own owner id -- which re-pinned the shared
+    // reference, which made this hook re-pin the next frame, and so on. 2,000+
+    // "reference pinned" lines, and head look never applied once: a flat,
+    // fixed third-person picture. The layer-3 hook claiming the build whenever
+    // it is driving at all keeps one owner, so the pin happens once.
+    g_vcDroveThisBuild.store(true, std::memory_order_relaxed);
 }
 
 
@@ -4384,16 +4414,115 @@ static bool GpPovNameIsSnake(uint32_t obj) {
     return strstr(buf, "sna_init") != nullptr;
 }
 
-// Snake in a vehicle: a task whose source-file name says so, and the DG_OBJS
-// inside it that has a posed head joint. Cached; re-validated by name.
+// Is this task still LINKED in the game's live task lists? Freed tasks keep
+// their memory (name and all) readable for a while after a level change.
+static bool GpPovTaskLinked(uint32_t want) {
+    const uintptr_t lo = g_moduleBase + kEntityHeadTableRva;
+    const uintptr_t hi = lo + 16u * kEntityHeadStride;
+    for (int c = 0; c < 16; ++c) {
+        const uintptr_t head = lo + (unsigned)c * kEntityHeadStride;
+        int32_t first = 0;
+        if (!SafeRead32(head, &first)) continue;
+        uint32_t node = (uint32_t)first;
+        for (int n = 0; n < 512 && node != 0 && node != (uint32_t)head; ++n) {
+            if (node < 0x00400000u || node >= 0x7FFF0000u || (node & 3u) != 0u) break;
+            if ((uintptr_t)node >= lo && (uintptr_t)node < hi) break;
+            if (node == want) return true;
+            int32_t next = 0;
+            if (!SafeRead32((uintptr_t)node, &next)) break;
+            node = (uint32_t)next;
+        }
+    }
+    return false;
+}
+
+// Is an on-foot Snake (sna_init, linked in the live task lists) the player
+// right now? The torture tasks only stand in for him when he is NOT -- the
+// small sne_03c helper (0x38 bytes, same source name) may well live beside a
+// walking Snake in the cell. Cached for 300 ms (a list walk each time).
+static bool GpPovLiveSnaInit() {
+    static bool s_live = false;
+    static unsigned long long s_tick = 0;
+    const unsigned long long t = GetTickCount64();
+    if (s_tick && t - s_tick < 300) return s_live;
+    s_tick = t;
+    int32_t obj = 0;
+    s_live = SafeRead32(g_moduleBase + kPlayerObjPtrRva, &obj) &&
+        (uint32_t)obj >= 0x00400000u && (uint32_t)obj < 0x7FFF0000u &&
+        GpPovNameIsSnake((uint32_t)obj) && GpPovTaskLinked((uint32_t)obj);
+    return s_live;
+}
+
+// Diagnostic for the next place Snake's eyes drops out: which class-5 tasks
+// (Snake's class -- sna_init, rope.c, torture.c all live there) exist at the
+// moment no player object could be found. Short names, a few lines per run.
+static void GpPovLogClass5Names(const char* why) {
+    static int s_lines = 0;
+    static unsigned long long s_last = 0;
+    const unsigned long long t = GetTickCount64();
+    if (s_lines >= 6 || (s_last && t - s_last < 5000)) return;
+    s_last = t;
+    s_lines++;
+    std::string out;
+    const uintptr_t lo = g_moduleBase + kEntityHeadTableRva;
+    const uintptr_t hi = lo + 16u * kEntityHeadStride;
+    const uintptr_t head = lo + 5u * kEntityHeadStride;
+    int32_t first = 0;
+    int count = 0;
+    if (SafeRead32(head, &first)) {
+        uint32_t node = (uint32_t)first;
+        for (int n = 0; n < 96 && node != 0 && node != (uint32_t)head; ++n) {
+            if (node < 0x00400000u || node >= 0x7FFF0000u || (node & 3u) != 0u) break;
+            if ((uintptr_t)node >= lo && (uintptr_t)node < hi) break;
+            char nm[64] = {};
+            if (ReadTaskName(node, nm, sizeof(nm))) {
+                const char* b = std::strrchr(nm, '\\');
+                b = b ? b + 1 : nm;
+                if (out.find(b) == std::string::npos) { if (!out.empty()) out += ' '; out += b; }
+            }
+            count++;
+            int32_t next = 0;
+            if (!SafeRead32((uintptr_t)node, &next)) break;
+            node = (uint32_t)next;
+        }
+    }
+    DebugLogger::LogFormat("Gameplay Snake's eyes: %s -- class-5 tasks right now (%d): %s", why, count,
+        out.empty() ? "(none readable)" : out.c_str());
+}
+
+// Snake in a vehicle -- or on the rappel rope (rope\rope.c, kind 3): a task
+// whose source-file name says so, and the DG_OBJS inside it that has a posed
+// head joint. Cached; re-validated by name.
 static bool GpPovFindVehicleSnake(uint32_t* outObj, uint32_t* outObjs) {
     static uint32_t s_obj = 0, s_objs = 0;
     static unsigned long long s_lastScan = 0;
-    static const char* const kNames[] = { "jeep_sne", "pkjp_sne", "sne17a", "snake18" };
-    auto nameOk = [](uint32_t node) {
+    static const char* const kNames[] = { "jeep_sne", "pkjp_sne", "sne17a", "snake18", "rope\\rope.c",
+                                          "torture\\torture.c", "torture\\sne_03c.c" };
+    auto isRopeName = [](const char* nm) { return std::strstr(nm, "rope\\rope.c") != nullptr; };
+    auto isTortureName = [](const char* nm) {
+        return std::strstr(nm, "torture\\torture.c") != nullptr || std::strstr(nm, "torture\\sne_03c.c") != nullptr;
+    };
+    auto nameOk = [&](uint32_t node) {
         char nm[64];
         if (!ReadTaskName(node, nm, sizeof(nm))) return false;
-        for (const char* n : kNames) if (std::strstr(nm, n)) return true;
+        for (const char* n : kNames) {
+            if (!std::strstr(nm, n)) continue;
+            if (isRopeName(nm) && !g_gpPovRope) return false;
+            if (isTortureName(nm)) {
+                if (!g_gpPovTorture) return false;
+                // sne_03c.c registers TWO tasks under one name (task roster):
+                // Snake (0x800, init 5047A7 / update 504605) and a 0x38-byte
+                // helper (504B0A / 504963). Only the big one carries his model.
+                int32_t f8 = 0, fc = 0;
+                SafeRead32((uintptr_t)node + 0x08, &f8);
+                SafeRead32((uintptr_t)node + 0x0C, &fc);
+                const uint32_t h1 = (uint32_t)(g_moduleBase + 0x104B0A), h2 = (uint32_t)(g_moduleBase + 0x104963);
+                if ((uint32_t)f8 == h1 || (uint32_t)f8 == h2 || (uint32_t)fc == h1 || (uint32_t)fc == h2) return false;
+                // Only when no walking Snake is the player.
+                if (GpPovLiveSnaInit()) return false;
+            }
+            return true;
+        }
         return false;
     };
     auto objsOk = [](uint32_t p) {
@@ -4412,30 +4541,11 @@ static bool GpPovFindVehicleSnake(uint32_t* outObj, uint32_t* outObjs) {
     // the view was built from it ("VR mode takes me outside of the map"). A
     // cached task now has to be found LINKED in the live task lists again
     // (checked every 300 ms), or it is dropped.
-    auto linkedLive = [](uint32_t want) {
-        const uintptr_t lo = g_moduleBase + kEntityHeadTableRva;
-        const uintptr_t hi = lo + 16u * kEntityHeadStride;
-        for (int c = 0; c < 16; ++c) {
-            const uintptr_t head = lo + (unsigned)c * kEntityHeadStride;
-            int32_t first = 0;
-            if (!SafeRead32(head, &first)) continue;
-            uint32_t node = (uint32_t)first;
-            for (int n = 0; n < 128 && node != 0 && node != (uint32_t)head; ++n) {
-                if (node < 0x00400000u || node >= 0x7FFF0000u || (node & 3u) != 0u) break;
-                if ((uintptr_t)node >= lo && (uintptr_t)node < hi) break;
-                if (node == want) return true;
-                int32_t next = 0;
-                if (!SafeRead32((uintptr_t)node, &next)) break;
-                node = (uint32_t)next;
-            }
-        }
-        return false;
-    };
     static unsigned long long s_verified = 0;
     if (s_obj && nameOk(s_obj) && objsOk(s_objs)) {
         const unsigned long long t = GetTickCount64();
         if (t - s_verified < 300) { *outObj = s_obj; *outObjs = s_objs; return true; }
-        if (linkedLive(s_obj)) { s_verified = t; *outObj = s_obj; *outObjs = s_objs; return true; }
+        if (GpPovTaskLinked(s_obj)) { s_verified = t; *outObj = s_obj; *outObjs = s_objs; return true; }
         DebugLogger::LogFormat("Gameplay Snake's eyes: vehicle task %08X is no longer in the game's task lists "
             "(level changed) -- dropped", s_obj);
         s_obj = s_objs = 0;
@@ -4443,11 +4553,19 @@ static bool GpPovFindVehicleSnake(uint32_t* outObj, uint32_t* outObjs) {
         g_gpPovVehicleTick.store(0, std::memory_order_relaxed);
         return false;
     }
+    if (s_obj) {
+        // The task ended (rope.c is deleted when Snake lands) or its model
+        // stopped looking posed. Drop the kind so nothing downstream keeps
+        // treating him as riding.
+        g_gpPovVehicleKind.store(0, std::memory_order_relaxed);
+    }
     s_obj = s_objs = 0;
     const unsigned long long now = GetTickCount64();
-    if (now - s_lastScan < 1000) return false;          // a scan is cheap, but not every frame
+    // A scan is cheap, but not every frame. 250 ms, not a second: the rope
+    // task appears the moment Snake steps off the roof, and until it is found
+    // the view would sit on whatever the game shows.
+    if (now - s_lastScan < 250) return false;
     s_lastScan = now;
-    s_obj = s_objs = 0;
     const uintptr_t tableLo = g_moduleBase + kEntityHeadTableRva;
     const uintptr_t tableHi = tableLo + 16u * kEntityHeadStride;
     const uint32_t playerDef = g_playerModelDef.load(std::memory_order_relaxed);
@@ -4460,27 +4578,59 @@ static bool GpPovFindVehicleSnake(uint32_t* outObj, uint32_t* outObjs) {
             if (node < 0x00400000u || node >= 0x7FFF0000u || (node & 3u) != 0u) break;
             if ((uintptr_t)node >= tableLo && (uintptr_t)node < tableHi) break;
             if (nameOk(node)) {
+                char nm[64] = {};
+                ReadTaskName(node, nm, sizeof(nm));
+                const bool rope = isRopeName(nm);
+                const bool torture = isTortureName(nm);
+                // rope.c is a 0x1098-byte task (task roster); torture.c 0x904,
+                // sne_03c.c 0x800; vehicles fit in 0x800.
+                const uint32_t scanEnd = rope ? 0x1090u
+                                       : torture ? (std::strstr(nm, "torture.c") ? 0x900u : 0x7FCu)
+                                       : 0x800u;
+                const bool mostJoints = rope || torture;
                 // Prefer the DG_OBJS built from Snake's own model; the first
-                // plausible one (the jeep, the gun) only as a last resort.
+                // plausible one (the jeep, the gun) only as a last resort. On
+                // the rope the fallback is the candidate with the MOST joints
+                // (Snake's skeleton, not a short run of rope segments).
                 uint32_t best = 0, any = 0;
-                for (uint32_t off = 0x20; off < 0x800 && !best; off += 4) {
+                int16_t anyN = 0;
+                int found = 0;
+                for (uint32_t off = 0x20; off < scanEnd && !best; off += 4) {
                     int32_t p = 0;
                     if (!SafeRead32((uintptr_t)node + off, &p) || !objsOk((uint32_t)p)) continue;
                     int32_t def = 0;
+                    int16_t nj = 0;
                     SafeRead32((uintptr_t)(uint32_t)p + 0x24, &def);
+                    SafeRead16((uintptr_t)(uint32_t)p + 0x2E, &nj);
+                    if (mostJoints) found++;
+                    static int s_candLog = 0;
+                    if (mostJoints && s_candLog < 24) {
+                        s_candLog++;
+                        DebugLogger::LogFormat("Gameplay Snake's eyes: %s task %08X candidate model at +0x%X = %08X "
+                            "(%d joints, def %08X%s)", rope ? "rope" : "torture", node, off, (uint32_t)p, (int)nj,
+                            (uint32_t)def, (playerDef != 0 && (uint32_t)def == playerDef) ? " = Snake's model" : "");
+                    }
                     if (playerDef != 0 && (uint32_t)def == playerDef) best = (uint32_t)p;
-                    else if (!any) any = (uint32_t)p;
+                    else if (!any || (mostJoints && nj > anyN)) { any = (uint32_t)p; anyN = nj; }
                 }
                 if (!best) best = any;
                 if (best) {
                     s_obj = node; s_objs = best;
                     s_verified = GetTickCount64();
-                    char nm[64] = {};
-                    ReadTaskName(node, nm, sizeof(nm));
-                    g_gpPovVehicleKind.store(std::strstr(nm, "snake18") ? 2 : 1, std::memory_order_relaxed);
-                    DebugLogger::LogFormat("Gameplay Snake's eyes: Snake is in a vehicle -- task %08X (%s), model %08X",
+                    g_gpPovVehicleKind.store(rope ? 3 : torture ? 4 : (std::strstr(nm, "snake18") ? 2 : 1),
+                        std::memory_order_relaxed);
+                    DebugLogger::LogFormat("Gameplay Snake's eyes: Snake is %s -- task %08X (%s), model %08X",
+                        rope ? "on the rappel rope" : torture ? "held by Ocelot (torture rack / cell)" : "in a vehicle",
                         node, nm, best);
                     break;
+                }
+                else if (mostJoints) {
+                    static int s_ropeMiss = 0;
+                    if (s_ropeMiss < 6) {
+                        s_ropeMiss++;
+                        DebugLogger::LogFormat("Gameplay Snake's eyes: %s task %08X found but no posed model "
+                            "inside it yet (%d candidates)", rope ? "rope" : "torture", node, found);
+                    }
                 }
             }
             int32_t next = 0;
@@ -4610,8 +4760,29 @@ static bool DriveGameplayPov(unsigned callerRva, uint32_t fromPtr, uint32_t toPt
         (uint32_t)obj < 0x00400000u || (uint32_t)obj >= 0x7FFF0000u || !GpPovNameIsSnake((uint32_t)obj) ||
         !SafeRead32((uintptr_t)(uint32_t)obj + 0x9C, &objs) ||
         (uint32_t)objs < 0x00400000u || (uint32_t)objs >= 0x7FFF0000u) {
+        GpPovLogClass5Names("no live player object");
         return standDown("no live player object (sna_init / *_sne)");
     }
+    // 2026-10-04 (rappel): stepping onto the rope frees sna_init, but its
+    // memory stays readable -- name and all -- so for a moment the view was
+    // built from a dead Snake somewhere else entirely (y=-28896, log 14:16:57).
+    // Same cure as the vehicle cache: it has to be linked in the live lists.
+    if (onFoot) {
+        static uint32_t s_linkObj = 0;
+        static unsigned long long s_linkTick = 0;
+        const unsigned long long t = GetTickCount64();
+        if ((uint32_t)obj != s_linkObj || t - s_linkTick >= 300) {
+            if (!GpPovTaskLinked((uint32_t)obj)) {
+                s_linkObj = 0;
+                return standDown("player object freed (no longer in the game's task lists)");
+            }
+            s_linkObj = (uint32_t)obj;
+            s_linkTick = t;
+        }
+    }
+    const bool rope = !onFoot && g_gpPovVehicleKind.load(std::memory_order_relaxed) == 3;
+    const bool torture = !onFoot && g_gpPovVehicleKind.load(std::memory_order_relaxed) == 4;
+    const bool eyeAtHead = onFoot || rope || torture;   // rope / rack: at his head, as far as the eye goes
     if (!SafeRead16((uintptr_t)(uint32_t)objs + 0x2E, &nJoints) || nJoints <= 6 ||
         !SafeRead32((uintptr_t)(uint32_t)objs + 0x284, &hx) || !SafeRead32((uintptr_t)(uint32_t)objs + 0x288, &hy) ||
         !SafeRead32((uintptr_t)(uint32_t)objs + 0x28C, &hz))
@@ -4635,9 +4806,35 @@ static bool DriveGameplayPov(unsigned callerRva, uint32_t fromPtr, uint32_t toPt
 
     float bodyYaw = NormalizeRad(((float)(((int)rotY) & 0xFFF)) * (2.0f * kPi / 4096.0f) +
         (float)g_csPovYawOffsetDeg * kPi / 180.0f);
+    // Facing from the model's own root matrix (DG_OBJS.world at +0, 3x3
+    // int16, 4096 = 1). Model forward is +Z, so world forward is column 2:
+    // (m02, m12, m22) -- yaw = ratan2(m02, m22), the same convention as rotY.
+    auto rootYaw = [&](float* out) {
+        int16_t m02 = 0, m22 = 0;
+        if (!SafeRead16((uintptr_t)(uint32_t)objs + 0x04, &m02) || !SafeRead16((uintptr_t)(uint32_t)objs + 0x10, &m22))
+            return false;
+        if (std::abs((int)m02) + std::abs((int)m22) < 1024) return false;   // lying flat / not a rotation
+        *out = std::atan2((float)m02, (float)m22);
+        return true;
+    };
+    if (onFoot) {
+        // One-time check that the matrix reading agrees with sna_init's rotY
+        // (it decides where the torture view starts).
+        static int s_rootCheck = 0;
+        float ry = 0.0f;
+        if (s_rootCheck < 3 && rootYaw(&ry)) {
+            s_rootCheck++;
+            DebugLogger::LogFormat("Gameplay Snake's eyes: root-matrix facing check -- matrix %.1f deg vs rotY %.1f deg "
+                "(should match; the torture rack uses the matrix)", ry * 180.0f / kPi,
+                ((float)(((int)rotY) & 0xFFF)) * 360.0f / 4096.0f);
+        }
+    }
     if (!onFoot) {
         ViewPoint gf{}, gt{};
-        if (ReadViewPoint((uintptr_t)fromPtr, &gf) && ReadViewPoint((uintptr_t)toPtr, &gt) &&
+        float ry = 0.0f;
+        if (torture && rootYaw(&ry))
+            bodyYaw = NormalizeRad(ry + (float)g_gpPovTortureYawOffsetDeg * kPi / 180.0f);
+        else if (ReadViewPoint((uintptr_t)fromPtr, &gf) && ReadViewPoint((uintptr_t)toPtr, &gt) &&
             (gt.x != gf.x || gt.z != gf.z))
             bodyYaw = std::atan2((float)(gt.x - gf.x), (float)(gt.z - gf.z));
     }
@@ -4713,12 +4910,17 @@ static bool DriveGameplayPov(unsigned callerRva, uint32_t fromPtr, uint32_t toPt
     // head, along the base yaw (not the head yaw, so looking around does not
     // swing the eye), so the mounted gun sits out in front of you.
     const float bsy = std::sin(baseYaw), bcy = std::cos(baseYaw);
-    const float push = onFoot ? (float)g_gpPovForward : -(float)g_gpPovVehBack;
-    const float lift = onFoot ? 0.0f : (float)g_gpPovVehUp;
+    // On the rope: at the head like on foot, but nearer it -- his face is a
+    // hand's width from the wall.
+    const float push = onFoot  ? (float)g_gpPovForward
+                     : rope    ? (float)g_gpPovRopeForward
+                     : torture ? (float)g_gpPovTortureForward
+                               : -(float)g_gpPovVehBack;
+    const float lift = eyeAtHead ? 0.0f : (float)g_gpPovVehUp;
     const ViewPoint newFrom{
-        (int32_t)std::lround((float)hx + (onFoot ? sy : bsy) * push + ox),
+        (int32_t)std::lround((float)hx + (eyeAtHead ? sy : bsy) * push + ox),
         (int32_t)std::lround((float)hy + lift + oy),
-        (int32_t)std::lround((float)hz + (onFoot ? cy : bcy) * push + oz) };
+        (int32_t)std::lround((float)hz + (eyeAtHead ? cy : bcy) * push + oz) };
     const ViewPoint newTo{
         newFrom.x + (int32_t)std::lround(fwdX * 1024.0f),
         newFrom.y + (int32_t)std::lround(fwdY * 1024.0f),
@@ -4797,6 +4999,7 @@ static bool DriveGameplayPov(unsigned callerRva, uint32_t fromPtr, uint32_t toPt
         r.kPitch = 1;
         r.clip = (lens >= 64 && lens <= 4000) ? lens : 0;
         r.tick = nowTick;
+        { LARGE_INTEGER q; QueryPerformanceCounter(&q); r.qpc = q.QuadPart; }
         r.pov = true;
         AcquireSRWLockExclusive(&g_frameRecLock);
         g_frameRec = r;
@@ -4820,7 +5023,7 @@ static bool DriveGameplayPov(unsigned callerRva, uint32_t fromPtr, uint32_t toPt
             (int)ox, (int)oy, (int)oz, lens, newFrom.x, newFrom.y, newFrom.z, newTo.x, newTo.y, newTo.z,
             gameFrom.x, gameFrom.y, gameFrom.z, gameTo.x, gameTo.y, gameTo.z,
             g_lastFpvState ? 1 : 0, (int)(scriptCam & 3), [&]() { float pf = 0; return GetGamePadFrameYaw(&pf) ? pf * 180.0f / kPi : -999.0f; }(),
-            onFoot ? "foot" : "vehicle");
+            onFoot ? "foot" : (rope ? "rope" : (torture ? "torture" : "vehicle")));
     }
     return true;
 }
@@ -4917,6 +5120,42 @@ extern "C" void __cdecl Mgs1ViewBuildBody(uint32_t* stack) {
     if (DriveGameplayPov(callerRva, fromPtr, toPtr, stack, frame)) {
         g_vcDroveThisBuild.store(false, std::memory_order_relaxed);
         return;
+    }
+
+    // --- PSG1 LENS, at the point of use (2026-10-04) -------------------------
+    // Test: "the scope is small with no zoom; randomly it is large and zoomed,
+    // very briefly". Log: the scope wrote clip_distance 1100, but the frames
+    // were drawn at 1466 -- rifle.c adds a third to the lens every frame while
+    // the PSG1 is out (scope down: 120 became 160 the same way). The headset
+    // only magnifies a frame whose lens is exactly the scope's (1100), so the
+    // 1466 frames went out at their true 12.5 degrees -- a small, unmagnified
+    // picture -- and only the odd frame that escaped the +1/3 was shown big.
+    // The lens handed to the view builder is the last word (the chanl's clip,
+    // the sky, the frame record and the headset claim all follow it), so it is
+    // set here, after rifle.c: scope up = the scope's zoom, PSG1 down = the
+    // mod's normal first-person lens. First person, VR mode, layer-3 pair only.
+    if (g_scopeEnabled && g_lastFpvState && fromPtr == (uint32_t)(g_moduleBase + 0x593F60) &&
+        g_vrViewMode.load(std::memory_order_relaxed) && g_enabled.load(std::memory_order_relaxed)) {
+        int16_t weaponId = -1;
+        SafeRead16(g_moduleBase + 0x38E7FC, &weaponId);              // GM_CurrentWeaponId
+        int want = 0;
+        if (weaponId == 9 && g_scopeActive.load(std::memory_order_relaxed)) want = g_scopeClip;
+        else if (weaponId == 9 && g_fovClipDistance > 0) want = g_fovClipDistance;
+        if (want > 0) {
+            int32_t argFov = 0;
+            SafeRead32((uintptr_t)(stack + 4), &argFov);
+            if (argFov != want) {
+                SafeWrite32((uintptr_t)(stack + 4), (uint32_t)want);
+                SafeWrite32(g_moduleBase + kViewFovRva, (uint32_t)want);
+                static int s_psgLensLog = 0;
+                if (s_psgLensLog < 8) {
+                    s_psgLensLog++;
+                    DebugLogger::LogFormat("PSG1 lens: the game handed the view builder %d, set to %d (%s)",
+                        (int)argFov, want, want == g_scopeClip ? "scope up -- zoomed and magnified"
+                                                                 : "scope down -- normal first-person lens");
+                }
+            }
+        }
     }
 
     const bool vrMode = g_vrViewMode.load(std::memory_order_relaxed);
@@ -5417,6 +5656,7 @@ static bool DriveSnakePov(uint32_t scene, uint32_t data, unsigned long long fram
         r.kPitch = 1;
         r.clip = (lens >= 64 && lens <= 4000) ? (int)lens : 0;
         r.tick = GetTickCount64();
+        { LARGE_INTEGER q; QueryPerformanceCounter(&q); r.qpc = q.QuadPart; }
         AcquireSRWLockExclusive(&g_frameRecLock);
         g_frameRec = r;
         g_frameRecRun = g_rotHookRuns.load(std::memory_order_relaxed);
@@ -6937,8 +7177,10 @@ bool GameplayPovWantsStickTurn() {
     if (!g_gpPovRightStickTurn || !IsGameplayPovActive() || g_fpvHold.load(std::memory_order_relaxed)) return false;
     if (g_gpPovRightStickTurn == 2) return true;
     // Round 10: any vehicle (REX top AND the jeep escape -- "can we have my
-    // ability to move the camera back during the jeep escape").
-    return IsGameplayPovInVehicle();
+    // ability to move the camera back during the jeep escape"). Not the rappel
+    // rope: only your head turns the view there.
+    return IsGameplayPovInVehicle() && g_gpPovVehicleKind.load(std::memory_order_relaxed) != 3 &&
+        g_gpPovVehicleKind.load(std::memory_order_relaxed) != 4;
 }
 
 bool GetGameplayPovPair(int16_t from[3], int16_t to[3]) {

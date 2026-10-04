@@ -910,6 +910,219 @@ static bool CodecScreenWanted() {
     if (open) return true;
     return g_codecExitHoldMs > 0 && s_closedAt && GetTickCount64() - s_closedAt < (ULONGLONG)g_codecExitHoldMs;
 }
+// [openxr] post_aa_percent (0..100): FXAA-style edge smoothing in the blit
+// (2026-10-04). 0 = off. Applied in the same pass as sharpening; an edge pixel
+// gets the anti-aliased colour, everything else keeps the sharpened one.
+static float g_postAaAmount = 1.0f;
+
+// ===========================================================================
+// FRAME PACING (2026-10-04)
+// ===========================================================================
+// The game delivers ~30 images a second; the headset shows 72-90. Each image
+// should stay on screen for the SAME number of headset refreshes (3 at 90 Hz).
+// Without pacing this thread grabbed the newest image the moment it existed,
+// and because the game's own frame limiter (Sleep-based) and our converter
+// thread both wobble by a few ms, an image arriving just after a refresh
+// boundary was shown for 2 refreshes and the next one for 4. That uneven
+// 2-3-4 cadence is judder on everything that moves in the game world.
+//
+// The pacer phase-locks onto the game's arrival times (a small PLL: predicted
+// arrival = last prediction + period, nudged 10% toward each real arrival), so
+// its idea of "when the next image is due" is smooth even when the arrivals are
+// not. A new image is released at the first headset frame at or after
+// (smoothed arrival + margin), where margin covers the measured arrival jitter
+// (auto) or frame_pacing_margin_ms. The cost is that margin in latency on the
+// GAME IMAGE only -- head rotation is still reprojected at full rate.
+//
+// Safety: an image is never held for more than 90% of a game frame, and a
+// pause/stall (>250 ms gap) re-seeds the lock, so a wrong estimate can delay a
+// frame slightly but can never drop or freeze one.
+//
+// PACE lines every 5 s in mgs1_vr_debug.log report the measured result: how
+// many headset refreshes each game image stayed up for (the histogram), with
+// pacing on OR off, so frame_pacing=0 vs 1 is a direct A/B.
+static bool g_framePacing = true;
+static int  g_framePacingMode = 2;        // 1 = timing-based (round 1), 2 = refresh-count lock (round 3)
+static int  g_framePacingMarginMs = -1;   // -1 = auto from measured jitter (mode 1)
+// MODE 2 (2026-10-04, round 3). The 14:00 wired log showed mode 1 topping out
+// at ~77% of images on an even 3 refreshes even with only 1.5 ms of arrival
+// jitter: deciding by clock time against a smoothed target still flips at
+// refresh boundaries. Mode 2 counts refreshes instead. Each released image
+// gets a quota (90 Hz / 30 fps -> 3 every time; 72 Hz -> 2,3,2,3,2 from an
+// accumulator) and the next image is released only once that quota is shown.
+// A late image just shows when it arrives -- which moves the lock one refresh
+// later, giving every following image a refresh of slack, so the lock settles
+// with ~1 refresh of headroom by itself. An image that has been waiting more
+// than 1.5 refreshes is released early to shed that headroom again, so the
+// added delay is bounded (about one refresh, 11 ms at 90 Hz).
+
+static double PaceQpcMs(long long q) {
+    static LARGE_INTEGER f{};
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    return (double)q * 1000.0 / (double)f.QuadPart;
+}
+
+struct FramePacer {
+    bool     havePll = false;
+    double   predArrMs = 0.0;       // smoothed arrival time of the newest image
+    double   lastArrMs = 0.0;       // real arrival time of the newest image
+    double   periodMs = 1000.0 / 30.0;
+    double   rawIntervalMs = 1000.0 / 30.0;   // median of the recent arrival intervals
+    double   intervals[15] = {};
+    int      intervalCount = 0, intervalNext = 0;
+    double   jitterMs = 2.0;        // mean |arrival - prediction|
+    double   marginMs = 3.0;
+    double   targetMs = 0.0;        // when the newest image is due on screen
+    uint64_t lastSeenSeq = 0;
+    bool     waiting = false;       // a new image exists that is not on screen yet
+    double   waitingArrMs = 0.0;
+    double   credit = 0.0;          // mode 2: refresh accumulator
+    int      quota = 3;             // mode 2: refreshes the current image is owed
+    int      shed = 0;              // mode 2: released early to shed latency (5 s)
+    // 5-second stats
+    int      curRun = 0;
+    int      runs[6] = {};          // [1..4] = shown for that many refreshes, [5] = 5+
+    int      released = 0, heldFrames = 0, overdue = 0;
+    double   ageAcc = 0.0;
+    ULONGLONG statStart = 0;
+};
+static FramePacer g_pacer;
+
+static void PacerOnArrival(FramePacer& p, double a, double displayPeriodMs) {
+    if (!p.havePll || a - p.lastArrMs > 250.0) {
+        // first image, or the game stopped for a while (pause, load): re-seed
+        p.havePll = true;
+        p.credit = 0.0;
+        p.predArrMs = a;
+        p.jitterMs = 2.0;
+    }
+    else {
+        // Median of the last 15 intervals: ignores the odd skipped or doubled
+        // frame, but follows a real cadence change (30 fps play, 24 fps
+        // cutscenes, 60 fps movies) within half a second.
+        const double interval = a - p.lastArrMs;
+        if (interval > 8.0 && interval < 120.0) {
+            p.intervals[p.intervalNext] = interval;
+            p.intervalNext = (p.intervalNext + 1) % 15;
+            if (p.intervalCount < 15) p.intervalCount++;
+            if (p.intervalCount >= 5) {
+                double tmp[15];
+                for (int i = 0; i < p.intervalCount; ++i) tmp[i] = p.intervals[i];
+                for (int i = 1; i < p.intervalCount; ++i)           // tiny insertion sort
+                    for (int j = i; j > 0 && tmp[j - 1] > tmp[j]; --j) { const double t = tmp[j]; tmp[j] = tmp[j - 1]; tmp[j - 1] = t; }
+                p.rawIntervalMs = tmp[p.intervalCount / 2];
+            }
+        }
+        double pred = p.predArrMs + p.periodMs;
+        // The game skipped a frame: step the prediction on by whole periods.
+        for (int g = 0; g < 4 && a - pred > p.periodMs * 0.5; ++g) pred += p.periodMs;
+        double e = a - pred;
+        if (e < -p.periodMs * 0.5) { pred = a; e = 0.0; }   // far early: re-seed the phase
+        double ec = e;
+        const double lim = p.periodMs * 0.25;
+        if (ec > lim) ec = lim;
+        if (ec < -lim) ec = -lim;
+        p.predArrMs = pred + 0.1 * ec;
+        p.periodMs += 0.01 * ec;
+        // Cadence change (gameplay 30 fps <-> cutscene 24 fps): follow it.
+        if (std::fabs(p.rawIntervalMs - p.periodMs) > 3.0) p.periodMs = p.rawIntervalMs;
+        if (p.periodMs < 14.0) p.periodMs = 14.0;
+        if (p.periodMs > 70.0) p.periodMs = 70.0;
+        p.jitterMs += 0.05 * (std::fabs(e) - p.jitterMs);
+    }
+    if (g_framePacingMarginMs >= 0) p.marginMs = (double)g_framePacingMarginMs;
+    else {
+        double m = 2.0 * p.jitterMs + 1.0;
+        if (m < 1.0) m = 1.0;
+        if (m > displayPeriodMs) m = displayPeriodMs;
+        p.marginMs = m;
+    }
+    p.targetMs = p.predArrMs + p.marginMs;
+    p.lastArrMs = a;
+}
+
+// Called once per headset frame, just before the game image is taken in.
+// Returns false when a new game image exists but is not due yet (the eye
+// textures keep the previous image this refresh). Returns true otherwise --
+// including "nothing new", where the capture call is a cheap no-op.
+// outReleased: a new image is being released this refresh.
+static bool PacerShouldTakeFrame(double nowMs, double displayPeriodMs, bool* outReleased) {
+    FramePacer& p = g_pacer;
+    *outReleased = false;
+    uint64_t seq = 0; long long aq = 0;
+    GetDdrawFrameArrival(&seq, &aq);
+    if (seq != 0 && seq != p.lastSeenSeq && aq != 0) {
+        PacerOnArrival(p, PaceQpcMs(aq), displayPeriodMs);
+        p.lastSeenSeq = seq;
+        p.waiting = true;
+        p.waitingArrMs = PaceQpcMs(aq);
+    }
+    bool take = true;
+    if (p.waiting) {
+        const double age = nowMs - p.waitingArrMs;
+        const bool tooOld = age > p.periodMs * 0.9;
+        bool due, shedNow = false;
+        if (g_framePacingMode == 2) {
+            due = p.curRun >= p.quota;
+            shedNow = !due && age >= displayPeriodMs * 1.5;
+        }
+        else {
+            due = nowMs + displayPeriodMs * 0.5 >= p.targetMs;
+        }
+        if (!g_framePacing || due || shedNow || tooOld) {
+            if (g_framePacing && tooOld && !due && !shedNow) p.overdue++;
+            if (g_framePacing && shedNow) p.shed++;
+            if (displayPeriodMs > 1.0) {
+                p.credit += p.periodMs / displayPeriodMs;
+                int q = (int)std::floor(p.credit + 0.5);
+                if (q < 1) q = 1;
+                p.credit -= q;
+                if (p.credit > 1.0) p.credit = 1.0;
+                if (p.credit < -1.0) p.credit = -1.0;
+                p.quota = q;
+            }
+            p.waiting = false;
+            *outReleased = true;
+            p.released++;
+            p.ageAcc += nowMs - p.waitingArrMs;
+            if (p.curRun > 0) p.runs[p.curRun >= 5 ? 5 : p.curRun]++;
+            p.curRun = 1;
+        }
+        else {
+            take = false;
+            p.heldFrames++;
+            p.curRun++;
+        }
+    }
+    else if (p.curRun > 0) {
+        p.curRun++;
+    }
+
+    const ULONGLONG nowTick = GetTickCount64();
+    if (p.statStart == 0) p.statStart = nowTick;
+    if (nowTick - p.statStart >= 5000) {
+        if (p.released > 0) {
+            DebugLogger::LogFormat(
+                "PACE: %s | game image every %.1f ms (arrival jitter %.1f ms, margin %.1f ms) | %d new images, "
+                "%d headset frames held one back, %d released by the 90%% safety, %d released early to cut delay | image age when shown avg %.1f ms | "
+                "headset frames per image  1:%d  2:%d  3:%d  4:%d  5+:%d  (even = smooth; at 90 Hz / 30 fps all should be 3)",
+                !g_framePacing ? "OFF (frame_pacing=0)" : (g_framePacingMode == 2 ? "ON (refresh-count lock)" : "ON (timing)"),
+                p.periodMs, p.jitterMs, p.marginMs,
+                p.released, p.heldFrames, p.overdue, p.shed, p.ageAcc / p.released,
+                p.runs[1], p.runs[2], p.runs[3], p.runs[4], p.runs[5]);
+        }
+        for (int i = 0; i < 6; ++i) p.runs[i] = 0;
+        p.released = 0; p.heldFrames = 0; p.overdue = 0; p.shed = 0; p.ageAcc = 0.0;
+        p.statStart = nowTick;
+    }
+    return take;
+}
+
+// Precise QPC of the frame view record of the image most recently uploaded
+// (0 = that image had no record). Motion aim uses it to measure how old the
+// held gun is by the time you see it.
+static long long g_lastUploadedRecQpc = 0;
+
 // [openxr] sharpen_percent (0..100): contrast-limited sharpening in the blit.
 static float g_sharpenAmount = 0.40f;
 // [openxr] fallback_debug_colors: before the first game frame arrives each eye
@@ -1147,6 +1360,25 @@ static void LoadRuntimeConfig() {
     if (g_codecExitHoldMs > 2000) g_codecExitHoldMs = 2000;
     DebugLogger::LogFormat("Codec on the virtual screen: %d (exit hold %d ms)", g_codecAsScreen ? 1 : 0, g_codecExitHoldMs);
     g_fallbackDebugColors = GetPrivateProfileIntA("openxr", "fallback_debug_colors", 0, g_iniPath.c_str()) != 0;
+    {
+        {
+            const int fp = (int)GetPrivateProfileIntA("openxr", "frame_pacing", 2, g_iniPath.c_str());
+            g_framePacing = fp != 0;
+            g_framePacingMode = fp == 1 ? 1 : 2;
+        }
+        g_framePacingMarginMs = (int)GetPrivateProfileIntA("openxr", "frame_pacing_margin_ms", -1, g_iniPath.c_str());
+        if (g_framePacingMarginMs > 20) g_framePacingMarginMs = 20;
+        int aa = (int)GetPrivateProfileIntA("openxr", "post_aa_percent", 100, g_iniPath.c_str());
+        if (aa < 0) aa = 0;
+        if (aa > 100) aa = 100;
+        g_postAaAmount = (float)aa / 100.0f;
+        DebugLogger::LogFormat("Frame pacing: %s (margin %s) | post AA: post_aa_percent=%d (0 = off). "
+            "PACE lines every 5 s show how many headset frames each game image stayed up for.",
+            !g_framePacing ? "OFF" : (g_framePacingMode == 2
+                ? "ON, mode 2 -- refresh-count lock (each game image shown for the same number of headset frames)"
+                : "ON, mode 1 -- timing-based"),
+            g_framePacingMarginMs < 0 ? "auto from measured jitter" : "fixed", aa);
+    }
     {
         int sp = (int)GetPrivateProfileIntA("openxr", "sharpen_percent", 40, g_iniPath.c_str());
         if (sp < 0) sp = 0;
@@ -1923,7 +2155,8 @@ static bool EnsureBlitPipeline() {
         "    float2 uvOffset;\n"
         "    float2 uvScale;\n"
         "    float  sharpen;\n"
-        "    float3 pad0;\n"
+        "    float  aa;\n"
+        "    float2 pad0;\n"
         "}\n"
         "struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
         "VSOut VSMain(uint id : SV_VertexID) {\n"
@@ -1939,6 +2172,14 @@ static bool EnsureBlitPipeline() {
         // space (the 640x480/1024x768 game frame is upscaled ~3x per eye, so
         // plain bilinear looks soft). Result is clamped to the local min/max
         // so edges get crisper without bright halos. sharpen=0 -> plain blit.
+        // 2026-10-04: FXAA-style edge anti-aliasing, also in source texel
+        // space (the eye buffer is roughly 1:1 with a 960p source, so this is
+        // a per-pixel pass). The four diagonal half-texel samples find the
+        // local edge direction; two/four taps along that edge are averaged. A
+        // pixel the edge test flags gets the smoothed colour (sharpening would
+        // only put the jaggies back); every other pixel keeps the sharpened one.
+        // aa = 0 -> exactly the previous shader.
+        "float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }\n"
         "float4 PSMain(VSOut i) : SV_TARGET {\n"
         "    float4 c = srcTex.Sample(linearSampler, i.uv);\n"
         "    float tw, th; srcTex.GetDimensions(tw, th);\n"
@@ -1949,8 +2190,27 @@ static bool EnsureBlitPipeline() {
         "    float3 w = srcTex.Sample(linearSampler, i.uv + float2(-d.x, 0)).rgb;\n"
         "    float3 mn = min(c.rgb, min(min(n, s), min(e, w)));\n"
         "    float3 mx = max(c.rgb, max(max(n, s), max(e, w)));\n"
-        "    float3 r = c.rgb + sharpen * (c.rgb - (n + s + e + w) * 0.25) * 2.0;\n"
-        "    return float4(clamp(r, mn, mx), c.a);\n"
+        "    float3 r = clamp(c.rgb + sharpen * (c.rgb - (n + s + e + w) * 0.25) * 2.0, mn, mx);\n"
+        "    if (aa <= 0.0) return float4(r, c.a);\n"
+        "    float3 cNW = srcTex.SampleLevel(linearSampler, i.uv + float2(-0.5, -0.5) * d, 0).rgb;\n"
+        "    float3 cNE = srcTex.SampleLevel(linearSampler, i.uv + float2( 0.5, -0.5) * d, 0).rgb;\n"
+        "    float3 cSW = srcTex.SampleLevel(linearSampler, i.uv + float2(-0.5,  0.5) * d, 0).rgb;\n"
+        "    float3 cSE = srcTex.SampleLevel(linearSampler, i.uv + float2( 0.5,  0.5) * d, 0).rgb;\n"
+        "    float lNW = Luma(cNW), lNE = Luma(cNE), lSW = Luma(cSW), lSE = Luma(cSE), lM = Luma(c.rgb);\n"
+        "    float lMin = min(lM, min(min(lNW, lNE), min(lSW, lSE)));\n"
+        "    float lMax = max(lM, max(max(lNW, lNE), max(lSW, lSE)));\n"
+        "    if (lMax - lMin < max(0.0312, lMax * 0.125)) return float4(r, c.a);\n"
+        "    float2 dir = float2(-((lNW + lNE) - (lSW + lSE)), (lNW + lSW) - (lNE + lSE));\n"
+        "    float dirReduce = max((lNW + lNE + lSW + lSE) * (0.25 * 0.125), 1.0 / 128.0);\n"
+        "    float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);\n"
+        "    dir = clamp(dir * rcpDirMin, -8.0, 8.0) * d;\n"
+        "    float3 rgbA = 0.5 * (srcTex.SampleLevel(linearSampler, i.uv + dir * (1.0 / 3.0 - 0.5), 0).rgb +\n"
+        "                         srcTex.SampleLevel(linearSampler, i.uv + dir * (2.0 / 3.0 - 0.5), 0).rgb);\n"
+        "    float3 rgbB = rgbA * 0.5 + 0.25 * (srcTex.SampleLevel(linearSampler, i.uv + dir * -0.5, 0).rgb +\n"
+        "                                       srcTex.SampleLevel(linearSampler, i.uv + dir * 0.5, 0).rgb);\n"
+        "    float lB = Luma(rgbB);\n"
+        "    float3 smoothed = (lB < lMin || lB > lMax) ? rgbA : rgbB;\n"
+        "    return float4(lerp(r, smoothed, aa), c.a);\n"
         "}\n";
 
     UINT compileFlags = 0;
@@ -2054,7 +2314,7 @@ static void SetBlitCropRegion(float uvOffsetX, float uvOffsetY, float uvScaleX, 
     if (SUCCEEDED(g_xrD3DContext->Map(g_blitCropCB, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped))) {
         float* f = reinterpret_cast<float*>(mapped.pData);
         f[0] = uvOffsetX; f[1] = uvOffsetY; f[2] = uvScaleX; f[3] = uvScaleY;
-        f[4] = g_sharpenAmount; f[5] = f[6] = f[7] = 0.0f;
+        f[4] = g_sharpenAmount; f[5] = g_postAaAmount; f[6] = f[7] = 0.0f;
         g_xrD3DContext->Unmap(g_blitCropCB, 0);
     }
     ID3D11Buffer* cbs[1] = { g_blitCropCB };
@@ -2409,6 +2669,7 @@ static bool CaptureGameFrameToMonoTexture() {
     }
 
     if (uploadBothEyes && frameRec.valid) g_latestRec = frameRec;
+    g_lastUploadedRecQpc = frameRec.valid ? frameRec.qpc : 0;
     {
         static int recUseLog = 0;
         static bool lastValid = false;
@@ -3664,14 +3925,35 @@ static DWORD WINAPI XrFrameThreadProc(LPVOID) {
             bool haveCapturedMonoFrame = false;
             LARGE_INTEGER xrCapT0, xrCapT1, xrQpcF;
             QueryPerformanceCounter(&xrCapT0);
+            static bool s_everUploaded = false;
             if (EnsureMonoCaptureResources(g_xrEyeTargets[0].width, g_xrEyeTargets[0].height)) {
-                haveCapturedMonoFrame = CaptureGameFrameToMonoTexture();
-                // Render twice hands a stereo pair out one eye per call. Take
-                // the rest of it now so both eyes of one game frame are shown
-                // in the same XR frame (never left from one frame, right from
-                // another).
-                for (int extra = 0; extra < 2 && GetPendingDdrawFrameCount() > 0; ++extra) {
-                    haveCapturedMonoFrame = CaptureGameFrameToMonoTexture() || haveCapturedMonoFrame;
+                // FRAME PACING: a new game image that is not due yet stays
+                // queued for a refresh; the eye textures keep the previous one.
+                const double displayPeriodMs = frameState.predictedDisplayPeriod > 0
+                    ? (double)frameState.predictedDisplayPeriod / 1.0e6 : 11.1;
+                const double paceNowMs = PaceQpcMs(xrCapT0.QuadPart);
+                bool released = false;
+                if (!PacerShouldTakeFrame(paceNowMs, displayPeriodMs, &released) && s_everUploaded) {
+                    haveCapturedMonoFrame = true;
+                }
+                else {
+                    haveCapturedMonoFrame = CaptureGameFrameToMonoTexture();
+                    // Render twice hands a stereo pair out one eye per call. Take
+                    // the rest of it now so both eyes of one game frame are shown
+                    // in the same XR frame (never left from one frame, right from
+                    // another).
+                    for (int extra = 0; extra < 2 && GetPendingDdrawFrameCount() > 0; ++extra) {
+                        haveCapturedMonoFrame = CaptureGameFrameToMonoTexture() || haveCapturedMonoFrame;
+                    }
+                    if (haveCapturedMonoFrame) s_everUploaded = true;
+                    // How old the newest image is when it first reaches your eyes,
+                    // measured from the game frame that drew it. Motion aim predicts
+                    // the held gun by exactly this much (hand_predict_ms=-1).
+                    if (released && g_lastUploadedRecQpc != 0) {
+                        const double ageMs = paceNowMs - PaceQpcMs(g_lastUploadedRecQpc);
+                        if (ageMs > 0.0 && ageMs < 250.0)
+                            MotionAimNoteImageTiming((float)ageMs, (float)g_pacer.periodMs, (float)displayPeriodMs);
+                    }
                 }
             }
             // XR PERF: how long this compositor frame spent taking the game's

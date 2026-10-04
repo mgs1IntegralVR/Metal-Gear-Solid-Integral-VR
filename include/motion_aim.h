@@ -64,6 +64,12 @@ void MotionAimPublishEyeImage(unsigned eye, const XrFovf& submittedFov,
 // player's shots from an enemy's (fire_window_ms).
 void MotionAimNoteFireButton(bool down);
 
+// XR thread (vr_injection.cpp), each time a new game image first reaches the
+// headset: how old it is (ms since the game frame that drew it), the game's
+// frame period and the headset's display period. The held gun is predicted by
+// this measured amount when [motion_aim] hand_predict_ms=-1.
+void MotionAimNoteImageTiming(float firstShowAgeMs, float gamePeriodMs, float displayPeriodMs);
+
 // True while the game's own weapon model is being driven by the controller
 // (gun in hand). Motion aim's bullet redirect stands down while this holds,
 // because the weapon then fires from the gun you are holding by itself.

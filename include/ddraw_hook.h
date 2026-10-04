@@ -24,6 +24,9 @@ bool GetLatestDdrawFrameRgba(std::vector<uint8_t>& outRgba, int32_t& outWidth, i
 // rescale and the texture upload when nothing has changed. 0 means no frame
 // from this path yet (e.g. the D3D9 fallback is the source instead).
 uint64_t GetDdrawFrameSequence();
+// The sequence plus the QueryPerformanceCounter time it last changed, i.e.
+// when the newest game image became available. Read together, under one lock.
+void GetDdrawFrameArrival(uint64_t* seq, long long* qpc);
 // True when the frame most recently handed out by GetLatestDdrawFrameRgba has
 // already had the wrist-HUD crops and masks applied (on the converter thread),
 // so the XR thread must not do it again.

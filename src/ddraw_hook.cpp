@@ -196,6 +196,11 @@ static int g_captureSuccessCount = 0;
 // and re-uploads the same pixels several times over for every real frame. That
 // work lands on the CPU at exactly the moments we can least afford it.
 static uint64_t g_captureSequence = 0;
+// QPC of the most recent sequence bump: when a new game image became
+// available to the headset thread. Frame pacing (vr_injection.cpp) locks onto
+// these arrival times. Guarded by g_captureMutex like the sequence itself.
+static long long g_captureSeqQpc = 0;
+static long long CaptureQpcNow() { LARGE_INTEGER t; QueryPerformanceCounter(&t); return t.QuadPart; }
 
 // --- adaptive capture throttle ----------------------------------------------
 // Measured, not theorised: in menus, codec calls, cutscenes and underwater the
@@ -753,6 +758,7 @@ static void CaptureFlippedSurfaceToSharedBuffer(IDirectDrawSurface7* surface, in
 		}
 		g_hasCapturedFrame = true;
 		g_captureSequence++;
+		g_captureSeqQpc = CaptureQpcNow();
 	}
 
 	g_captureSuccessCount++;
@@ -1165,6 +1171,12 @@ uint64_t GetDdrawFrameSequence() {
 	return g_captureSequence;
 }
 
+void GetDdrawFrameArrival(uint64_t* seq, long long* qpc) {
+	std::lock_guard<std::mutex> lock(g_captureMutex);
+	if (seq) *seq = g_captureSequence;
+	if (qpc) *qpc = g_captureSeqQpc;
+}
+
 int GetPendingDdrawFrameCount() {
 	std::lock_guard<std::mutex> lock(g_captureMutex);
 	return g_rtQueueCount;
@@ -1554,6 +1566,7 @@ static void RtConverterLoop() {
 			g_hasCapturedFrame = true;
 			g_rtQueueCount = 0;   // anything older is stale now
 			g_captureSequence++;
+			g_captureSeqQpc = CaptureQpcNow();
 			continue;
 		}
 		const LARGE_INTEGER t0 = QpcNow();
@@ -1587,6 +1600,7 @@ static void RtConverterLoop() {
 			g_rtQueueHead = 0;
 			g_rtQueueCount = 2;
 			g_captureSequence += 2;
+			g_captureSeqQpc = CaptureQpcNow();
 		}
 		accMs += ms; if (ms > maxMs) maxMs = ms; pairs++;
 		const long long now = NowMs();

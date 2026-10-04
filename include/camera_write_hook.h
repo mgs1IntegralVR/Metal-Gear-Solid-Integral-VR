@@ -371,6 +371,7 @@ struct FrameViewRecord {
     int       kPitch = 1;
     int       clip = 0;            // clip_distance the frame was projected with (0 = unknown)
     unsigned long long tick = 0;   // GetTickCount64 when recorded
+    long long qpc = 0;             // QueryPerformanceCounter when recorded (precise; tick is ~15 ms coarse)
     bool      pov = false;         // written by gameplay Snake's eyes (view build), not the rotation hook
 };
 

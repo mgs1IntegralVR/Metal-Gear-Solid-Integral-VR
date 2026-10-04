@@ -88,7 +88,27 @@ bool  g_cfgStingerHeadAim = true;    // [motion_aim] stinger_head_aim
 bool  g_cfgThrowAim = true;          // grenades/stun/chaff leave your hand along the laser
 bool  g_cfgGunThrowables = true;     // show the grenade/canister in your hand
 float g_cfgThrowSpeed = 1.0f;
-int   g_cfgHandPredictMs = 45;       // extrapolate the hand this far ahead (game-render latency)
+int   g_cfgHandPredictMs = -1;       // extrapolate the hand this far ahead; -1 = measured (auto)
+int   g_cfgHandPredictPercent = 80;  // how much of that horizon to actually predict
+// Hand smoothing (2026-10-04): a One Euro filter on the controller pose that
+// the HELD gun and both hands are drawn from. The aim laser keeps the raw pose.
+bool  g_cfgHandFilter = true;
+float g_cfgHandFilterMinCutHz = 1.5f;   // smoothing when the hand is still (lower = smoother, more lag)
+float g_cfgHandFilterPosBeta = 12.0f;   // Hz added per m/s of hand speed (higher = less lag when moving)
+float g_cfgHandFilterRotBeta = 2.0f;    // Hz added per rad/s of turning
+float g_cfgHandFilterDCutHz = 5.0f;     // smoothing of the velocity used for prediction
+// Stillness gate (2026-10-04, round 2): prediction (and the filter-lag
+// compensation) fades out as the hand slows, so a hand at rest is drawn at its
+// smoothed position with NO extrapolation. Below the "still" speed nothing is
+// predicted; above the "moving" speed all of it is.
+float g_cfgStillMps = 0.03f, g_cfgMovingMps = 0.15f;      // hand speed, m/s
+float g_cfgStillRads = 0.15f, g_cfgMovingRads = 0.80f;    // hand turn rate, rad/s
+bool  g_cfgHandJitterLog = true;                          // HandJitter lines
+// Measured on the XR thread (vr_injection.cpp): how old a game image is when
+// it first reaches your eyes, the game frame period and the display period.
+std::atomic<float> g_imgAgeMs{ 0.0f };
+std::atomic<float> g_imgPeriodMs{ 33.3f };
+std::atomic<float> g_dispPeriodMs{ 11.1f };
 bool  g_cfgThrowSwing = true;        // a real throwing swing sets the throw's direction and speed
 float g_cfgSwingMinMps = 1.2f;       // slower than this = an aimed throw instead
 float g_cfgSwingGain = 1.0f;
@@ -130,6 +150,15 @@ struct AimSnap {
     bool     haveWorld = false;
     float    wdir[3] = { 0, 0, -1 }, wpos[3] = { 0, 0, 0 }, wup[3] = { 0, 1, 0 }, wvel[3] = { 0, 0, 0 };
     float    pwdir[3] = { 0, 0, -1 }, pwpos[3] = { 0, 0, 0 }, pwup[3] = { 0, 1, 0 };
+    // FILTERED play-space pose (One Euro), its smoothed rates of change, and
+    // the lag the filter itself introduced (s), for the held gun and hands.
+    bool     haveFilt = false;
+    float    fwpos[3] = { 0, 0, 0 }, fwdir[3] = { 0, 0, -1 }, fwup[3] = { 0, 1, 0 };
+    float    vpos[3] = { 0, 0, 0 }, vdir[3] = { 0, 0, 0 }, vup[3] = { 0, 0, 0 };
+    float    lagPos = 0.0f, lagRot = 0.0f;
+    // head pose at publish, to place the hand when no render record exists
+    float    hpos[3] = { 0, 0, 0 };
+    XrQuaternionf hq{ 0, 0, 0, 1 };
 } g_snap;
 bool g_cfgRenderHeadFrame = true;    // [motion_aim] hand_relative_to_render_pose
 // --- left controller snapshot (published from the XR thread) ----------------
@@ -197,6 +226,60 @@ V3 QRot(const XrQuaternionf& q, V3 v) {
 }
 XrQuaternionf QInv(XrQuaternionf q) { q.x = -q.x; q.y = -q.y; q.z = -q.z; return q; }
 
+// ---------------------------------------------------------------------------
+// ONE EURO FILTER (Casiez et al. 2012), per 3-vector. Low cutoff when the hand
+// is still (kills tracking tremor), cutoff rising with speed (no lag when you
+// move). Its smoothed derivative is what the gun is predicted with -- not the
+// difference of the last two raw samples, which multiplied tracking noise by
+// the prediction horizon over one XR frame (~5x) and was the gun's jitter.
+// XR thread only.
+// ---------------------------------------------------------------------------
+struct Euro3 {
+    bool  have = false;
+    V3    x{ 0, 0, 0 };     // filtered value
+    V3    dx{ 0, 0, 0 };    // filtered rate of change, per second
+    float lag = 0.0f;       // 1/(2 pi fc) of the last step: the ramp lag it introduced, s
+};
+inline float EuroAlpha(float cutHz, float dt) {
+    const float tau = 1.0f / (2.0f * kPi * cutHz);
+    return 1.0f / (1.0f + tau / dt);
+}
+V3 EuroStep(Euro3& f, V3 raw, float dt, float minCut, float beta, float dCut) {
+    if (!f.have || !(dt > 0.0005f) || dt > 0.2f) {
+        f.have = true; f.x = raw; f.dx = V3{ 0, 0, 0 }; f.lag = 0.0f;
+        return raw;
+    }
+    const V3 rawDx = Mul(Sub(raw, f.x), 1.0f / dt);
+    f.dx = Add(f.dx, Mul(Sub(rawDx, f.dx), EuroAlpha(dCut, dt)));
+    const float cut = minCut + beta * Len(f.dx);
+    f.x = Add(f.x, Mul(Sub(raw, f.x), EuroAlpha(cut, dt)));
+    f.lag = 1.0f / (2.0f * kPi * cut);
+    return f.x;
+}
+struct HandEuro { Euro3 pos, dir, up; LONGLONG qpc = 0; };
+HandEuro g_euroR, g_euroL;
+
+// Runs the filter on one play-space controller sample and stores the result in
+// the snapshot (caller holds g_lock exclusively).
+void FilterIntoSnap(HandEuro& h, AimSnap& s, V3 pW, V3 dW, V3 uW, const XrPosef& head, LONGLONG nowQ) {
+    const float dt = h.qpc ? (float)((double)(nowQ - h.qpc) / (double)g_qpcFreq) : 0.0f;
+    h.qpc = nowQ;
+    const float mc = g_cfgHandFilterMinCutHz, dc = g_cfgHandFilterDCutHz;
+    const V3 fp = EuroStep(h.pos, pW, dt, mc, g_cfgHandFilterPosBeta, dc);
+    V3 fd = EuroStep(h.dir, dW, dt, mc, g_cfgHandFilterRotBeta, dc);
+    V3 fu = EuroStep(h.up, uW, dt, mc, g_cfgHandFilterRotBeta, dc);
+    if (!Norm(fd)) fd = dW;
+    if (!Norm(fu)) fu = uW;
+    auto put = [](float* d, V3 v) { d[0] = v.x; d[1] = v.y; d[2] = v.z; };
+    put(s.fwpos, fp); put(s.fwdir, fd); put(s.fwup, fu);
+    put(s.vpos, h.pos.dx); put(s.vdir, h.dir.dx); put(s.vup, h.up.dx);
+    s.lagPos = h.pos.lag;
+    s.lagRot = h.dir.lag;
+    s.hpos[0] = head.position.x; s.hpos[1] = head.position.y; s.hpos[2] = head.position.z;
+    s.hq = head.orientation;
+    s.haveFilt = true;
+}
+
 // yaw(Y) * pitch(X) * roll(Z) -- the same convention as the head angles.
 XrQuaternionf QFromYpr(float yaw, float pitch, float roll) {
     const float cy = std::cos(yaw * 0.5f), sy = std::sin(yaw * 0.5f);
@@ -217,10 +300,10 @@ XrQuaternionf QFromYpr(float yaw, float pitch, float roll) {
 // record's roll being the camera's (level) roll, tilting your head no longer
 // rolls the gun either. Leaves the snapshot untouched if there is no fresh
 // record (cutscenes, menus, record switched off) -- the old behaviour.
-void ToRenderHeadFrame(AimSnap& s) {
-    if (!g_cfgRenderHeadFrame || !s.valid || !s.haveWorld) return;
+bool ToRenderHeadFrame(AimSnap& s) {
+    if (!g_cfgRenderHeadFrame || !s.valid || !s.haveWorld) return false;
     FrameViewRecord r;
-    if (!GetLatestFrameViewRecord(&r, 150)) return;
+    if (!GetLatestFrameViewRecord(&r, 150)) return false;
     const XrQuaternionf inv = QInv(QFromYpr(r.yawEq, r.pitchEq, r.rollEq));
     const V3 c{ (r.eye[0].px + r.eye[1].px) * 0.5f, (r.eye[0].py + r.eye[1].py) * 0.5f,
                 (r.eye[0].pz + r.eye[1].pz) * 0.5f };
@@ -235,6 +318,7 @@ void ToRenderHeadFrame(AimSnap& s) {
         put(s.pup,  QRot(inv, get(s.pwup)));
         put(s.ppos, QRot(inv, Sub(get(s.pwpos), c)));
     }
+    return true;
 }
 
 bool ReadV16(uintptr_t rva, V3* out) {
@@ -423,6 +507,7 @@ void MotionAimPublishXrFrame(const XrPosef& head, const XrPosef& aim, bool aimVa
         g_snap.dir[0] = dL.x; g_snap.dir[1] = dL.y; g_snap.dir[2] = dL.z;
         g_snap.pos[0] = pL.x; g_snap.pos[1] = pL.y; g_snap.pos[2] = pL.z;
         g_snap.qpc = NowQpc();
+        FilterIntoSnap(g_euroR, g_snap, V3{ aim.position.x, aim.position.y, aim.position.z }, dW, uW, head, nowQ);
         ReleaseSRWLockExclusive(&g_lock);
     }
     else {
@@ -430,8 +515,10 @@ void MotionAimPublishXrFrame(const XrPosef& head, const XrPosef& aim, bool aimVa
         g_snap.valid = false;
         g_snap.havePrev = false;
         g_snap.haveWorld = false;
+        g_snap.haveFilt = false;
         ReleaseSRWLockExclusive(&g_lock);
         g_velTrack.have = false;
+        g_euroR = HandEuro{};
     }
 
     // ---- handedness calibration --------------------------------------------
@@ -939,6 +1026,27 @@ static V3 HeadCentreFromEye(V3 from, V3 R) {
     return out;
 }
 
+// How far ahead of the newest controller sample the held gun has to be drawn:
+// the measured age of a game image when it first reaches your eyes, plus half
+// of the time it then stays on screen, scaled by hand_predict_percent. A fixed
+// hand_predict_ms (>= 0) overrides the measurement. 45 ms until measured.
+double HandPredictHorizonMs() {
+    double h;
+    if (g_cfgHandPredictMs >= 0) h = (double)g_cfgHandPredictMs;
+    else {
+        const float age = g_imgAgeMs.load(std::memory_order_relaxed);
+        if (age <= 0.0f) h = 45.0;
+        else {
+            const float hold = g_imgPeriodMs.load(std::memory_order_relaxed) - g_dispPeriodMs.load(std::memory_order_relaxed);
+            h = (double)age + (hold > 0.0f ? 0.5 * hold : 0.0);
+        }
+        h *= (double)g_cfgHandPredictPercent / 100.0;
+    }
+    if (h < 0.0) h = 0.0;
+    if (h > 120.0) h = 120.0;
+    return h;
+}
+
 // Controller snapshot -> a world MATRIX in the gun/hand joint's local frame
 // (local -Y = forward, +Z = up; the frame Snake's hand joint and every weapon
 // model share, which is why the gun hangs from part 4 with no extra rotation).
@@ -952,19 +1060,73 @@ bool BuildControllerMatrix(AimSnap s, bool gunOffset, float rollDeg, const float
     const int sx = g_rightSign.load(), sy = g_upSign.load();
     if (sx == 0 || sy == 0) return false;
 
-    ToRenderHeadFrame(s);
     if (!s.valid || MsSince(s.qpc) > 150.0) return false;
 
-    // PREDICTION. The game draws this matrix into a frame that reaches your
+    // SMOOTHED + PREDICTED (2026-10-04, hand_filter=1). The filtered pose is
+    // carried forward along its smoothed velocity by the prediction horizon
+    // PLUS the lag the filter itself introduced, so smoothing costs no extra
+    // drag while the hand moves, and tracking tremor is not amplified.
+    bool smoothed = false;
+    if (g_cfgHandFilter && s.haveFilt && s.haveWorld) {
+        const float aheadS = (float)((MsSince(s.qpc) + HandPredictHorizonMs()) / 1000.0);
+        auto get = [](const float* a) { return V3{ a[0], a[1], a[2] }; };
+        auto put = [](float* d, V3 v) { d[0] = v.x; d[1] = v.y; d[2] = v.z; };
+        // Fade prediction out as the hand comes to rest: extrapolating a
+        // velocity that is only tracking noise is what made a still hand shake.
+        auto ramp = [](float v, float lo, float hi) {
+            if (hi <= lo) return v > lo ? 1.0f : 0.0f;
+            float t = (v - lo) / (hi - lo);
+            return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t * t * (3.0f - 2.0f * t));
+        };
+        const float kPos = ramp(Len(get(s.vpos)), g_cfgStillMps, g_cfgMovingMps);
+        const float kRot = ramp(Len(get(s.vdir)), g_cfgStillRads, g_cfgMovingRads);
+        V3 dp = Mul(get(s.vpos), (aheadS + s.lagPos) * kPos);
+        const float dpl = Len(dp);
+        if (dpl > 0.15f) dp = Mul(dp, 0.15f / dpl);
+        auto lead = [&](const float* x, const float* v) {
+            V3 d = Mul(get(v), (aheadS + s.lagRot) * kRot);
+            const float l = Len(d);
+            if (l > 0.6f) d = Mul(d, 0.6f / l);
+            V3 r = Add(get(x), d);
+            if (!Norm(r)) r = get(x);
+            return r;
+        };
+        const V3 wp = Add(get(s.fwpos), dp);
+        const V3 wd = lead(s.fwdir, s.vdir);
+        const V3 wu = lead(s.fwup, s.vup);
+        put(s.wpos, wp); put(s.wdir, wd); put(s.wup, wu);
+        s.havePrev = false;
+        if (!ToRenderHeadFrame(s)) {
+            // No render record: relative to the head pose at publish time.
+            const XrQuaternionf inv = QInv(s.hq);
+            put(s.dir, QRot(inv, wd));
+            put(s.up, QRot(inv, wu));
+            put(s.pos, QRot(inv, Sub(wp, get(s.hpos))));
+        }
+        smoothed = true;
+        static int s_smoothLog = 0;
+        if (s_smoothLog < 3 || (s_smoothLog % 900) == 0) {
+            DebugLogger::LogFormat("Hand smoothing: predicting %.0f ms ahead (+%.0f ms filter lag), image age %.0f ms, "
+                "game frame %.1f ms, headset frame %.1f ms | hand speed %.2f m/s -> prediction %.0f%% (pos) %.0f%% (turn)",
+                aheadS * 1000.0f, s.lagPos * 1000.0f, g_imgAgeMs.load(), g_imgPeriodMs.load(), g_dispPeriodMs.load(),
+                Len(get(s.vpos)), kPos * 100.0f, kRot * 100.0f);
+        }
+        s_smoothLog++;
+    }
+    else {
+        ToRenderHeadFrame(s);
+    }
+
+    // PREDICTION (legacy, hand_filter=0). The game draws this matrix into a frame that reaches your
     // eyes roughly one game frame plus capture plus one XR frame later
     // (~45 ms). Extrapolating the hand by that much -- from the last two
     // samples, so rotation AND position -- puts the gun where your hand will
     // be when you see it, instead of where it was. Clamped: a lost sample
     // can never fling it.
-    if (g_cfgHandPredictMs > 0 && s.havePrev) {
+    if (!smoothed && g_cfgHandPredictMs != 0 && s.havePrev) {
         const double span = (double)(s.qpc - s.pqpc) * 1000.0 / (double)g_qpcFreq;
         if (span > 2.0 && span < 60.0) {
-            double ahead = MsSince(s.qpc) + (double)g_cfgHandPredictMs;
+            double ahead = MsSince(s.qpc) + HandPredictHorizonMs();
             if (ahead > 100.0) ahead = 100.0;
             const float k = (float)(ahead / span);
             for (int i = 0; i < 3; ++i) {
@@ -1288,6 +1450,66 @@ FM InverseRigid(const FM& a) {
 }
 V3 MatCol(const GameMatrix& g, int c) { return V3{ g.m[0][c] / 4096.0f, g.m[1][c] / 4096.0f, g.m[2][c] / 4096.0f }; }
 V3 MatT(const GameMatrix& g) { return V3{ (float)g.t[0], (float)g.t[1], (float)g.t[2] }; }
+
+// ---------------------------------------------------------------------------
+// HAND JITTER MEASUREMENT (2026-10-04). While your right hand is still, a
+// still hand should give a still gun IN THE GAME WORLD (the world is what the
+// headset holds steady). Per game frame, frame-to-frame movement is measured
+// at four points of the chain and logged as RMS every ~4 s of stillness:
+//   controller : the raw tracked pose (what the headset reports)
+//   filtered   : after the One Euro filter
+//   gun        : the matrix the game draws the gun with, in game-world mm/deg
+//   camera     : the head centre the gun hangs from (moves with your head)
+// gun >> filtered means the jitter is added AFTER the filter (head/camera
+// mapping); filtered ~ controller means the filter is not doing its job.
+// ---------------------------------------------------------------------------
+struct JitStat { double ss = 0, mx = 0; int n = 0;
+    void Add(double v) { ss += v * v; if (v > mx) mx = v; ++n; }
+    double Rms() const { return n ? std::sqrt(ss / n) : 0.0; }
+    void Clear() { ss = mx = 0; n = 0; } };
+struct {
+    bool have = false;
+    V3 raw{}, rawDir{}, filt{}, filtDir{}, gun{}, gunDir{}, cam{};
+    JitStat raw_mm, raw_deg, filt_mm, filt_deg, gun_mm, gun_deg, cam_mm;
+    int lines = 0;
+} g_jit;
+inline double AngDeg(V3 a, V3 b) {
+    const float c = Dot(a, b) / std::fmax(1e-6f, Len(a) * Len(b));
+    return std::acos(std::fmax(-1.0f, std::fmin(1.0f, c))) * 180.0 / kPi;
+}
+void HandJitterSample(const AimSnap& s, const GameMatrix& G, V3 cam) {
+    if (!g_cfgHandJitterLog || !s.haveFilt) return;
+    auto get = [](const float* a) { return V3{ a[0], a[1], a[2] }; };
+    const bool still = Len(get(s.vpos)) < g_cfgStillMps && Len(get(s.vdir)) < g_cfgStillRads;
+    const V3 raw = get(s.wpos), rawDir = get(s.wdir), filt = get(s.fwpos), filtDir = get(s.fwdir);
+    const V3 gun = MatT(G), gunDir = Mul(MatCol(G, 1), -1.0f);
+    const float mmPerUnit = 1000.0f / g_cfgUnitsPerMetre;
+    if (still && g_jit.have) {
+        g_jit.raw_mm.Add(Len(Sub(raw, g_jit.raw)) * 1000.0);
+        g_jit.raw_deg.Add(AngDeg(rawDir, g_jit.rawDir));
+        g_jit.filt_mm.Add(Len(Sub(filt, g_jit.filt)) * 1000.0);
+        g_jit.filt_deg.Add(AngDeg(filtDir, g_jit.filtDir));
+        g_jit.gun_mm.Add(Len(Sub(gun, g_jit.gun)) * mmPerUnit);
+        g_jit.gun_deg.Add(AngDeg(gunDir, g_jit.gunDir));
+        g_jit.cam_mm.Add(Len(Sub(cam, g_jit.cam)) * mmPerUnit);
+        if (g_jit.gun_mm.n >= 120 && g_jit.lines < 60) {
+            ++g_jit.lines;
+            DebugLogger::LogFormat("HandJitter (hand still, %d frames, per game frame RMS / worst): "
+                "controller %.2f/%.2f mm %.3f/%.3f deg | filtered %.2f/%.2f mm %.3f/%.3f deg | "
+                "gun in game world %.2f/%.2f mm %.3f/%.3f deg | camera (head) %.2f/%.2f mm",
+                g_jit.gun_mm.n,
+                g_jit.raw_mm.Rms(), g_jit.raw_mm.mx, g_jit.raw_deg.Rms(), g_jit.raw_deg.mx,
+                g_jit.filt_mm.Rms(), g_jit.filt_mm.mx, g_jit.filt_deg.Rms(), g_jit.filt_deg.mx,
+                g_jit.gun_mm.Rms(), g_jit.gun_mm.mx, g_jit.gun_deg.Rms(), g_jit.gun_deg.mx,
+                g_jit.cam_mm.Rms(), g_jit.cam_mm.mx);
+            g_jit.raw_mm.Clear(); g_jit.raw_deg.Clear(); g_jit.filt_mm.Clear(); g_jit.filt_deg.Clear();
+            g_jit.gun_mm.Clear(); g_jit.gun_deg.Clear(); g_jit.cam_mm.Clear();
+        }
+    }
+    g_jit.have = true;
+    g_jit.raw = raw; g_jit.rawDir = rawDir; g_jit.filt = filt; g_jit.filtDir = filtDir;
+    g_jit.gun = gun; g_jit.gunDir = gunDir; g_jit.cam = cam;
+}
 void SetT(GameMatrix& g, V3 t) { g.t[0] = (int32_t)std::lround(t.x); g.t[1] = (int32_t)std::lround(t.y); g.t[2] = (int32_t)std::lround(t.z); }
 int16_t Clamp16(float v) { if (v > 32767.f) v = 32767.f; if (v < -32768.f) v = -32768.f; return (int16_t)std::lround(v); }
 
@@ -1478,6 +1700,7 @@ void HandsSnakePost(uint32_t work, uint32_t bodyOverride = 0) {
         // correction the right hand receives.
         GameMatrix G{}; float gReach = 0;
         const bool haveG = BuildControllerMatrix(sR, true, g_cfgGunRollDeg, nullptr, &G, &gReach, nullptr);
+        if (haveG && haveR) HandJitterSample(sR, G, head);
 
         const uint32_t hzd = (h_collision && !h_disabledRuntime) ? CurrentHzd() : 0;
         if (hzd) {
@@ -2065,9 +2288,10 @@ void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
     ReleaseSRWLockExclusive(&g_lock);
     if (!valid || !haveHead) {
         AcquireSRWLockExclusive(&g_lock);
-        g_snapL.valid = false; g_snapL.havePrev = false; g_snapL.haveWorld = false;
+        g_snapL.valid = false; g_snapL.havePrev = false; g_snapL.haveWorld = false; g_snapL.haveFilt = false;
         ReleaseSRWLockExclusive(&g_lock);
         g_velTrackL.have = false;
+        g_euroL = HandEuro{};
         return;
     }
     const XrQuaternionf inv = QInv(head.orientation);
@@ -2109,11 +2333,20 @@ void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
     s.vel[0] = vL.x; s.vel[1] = vL.y; s.vel[2] = vL.z;
     s.valid = true;
     s.qpc = nowQ;
+    FilterIntoSnap(g_euroL, s, V3{ grip.position.x, grip.position.y, grip.position.z }, dW, uW, head, nowQ);
     ReleaseSRWLockExclusive(&g_lock);
 }
 
 bool IsGunInHandActive() {
     return MsSince(g_gunActiveQpc.load(std::memory_order_relaxed)) < 250.0;
+}
+
+void MotionAimNoteImageTiming(float firstShowAgeMs, float gamePeriodMs, float displayPeriodMs) {
+    // Lightly smoothed: one late image must not yank the gun forward.
+    const float prev = g_imgAgeMs.load(std::memory_order_relaxed);
+    g_imgAgeMs.store(prev <= 0.0f ? firstShowAgeMs : prev + 0.1f * (firstShowAgeMs - prev), std::memory_order_relaxed);
+    g_imgPeriodMs.store(gamePeriodMs, std::memory_order_relaxed);
+    g_dispPeriodMs.store(displayPeriodMs, std::memory_order_relaxed);
 }
 
 #ifdef _M_IX86
@@ -2211,9 +2444,39 @@ void LoadMotionAimConfig() {
     g_cfgGunThrowables = I("gun_throwables", 1) != 0;
     g_cfgThrowSpeed = (float)I("throw_speed_percent", 100) / 100.0f;
     g_cfgRenderHeadFrame = I("hand_relative_to_render_pose", 1) != 0;
-    g_cfgHandPredictMs = I("hand_predict_ms", 45);
-    if (g_cfgHandPredictMs < 0) g_cfgHandPredictMs = 0;
+    g_cfgHandPredictMs = I("hand_predict_ms", -1);
+    if (g_cfgHandPredictMs < -1) g_cfgHandPredictMs = -1;
     if (g_cfgHandPredictMs > 100) g_cfgHandPredictMs = 100;
+    g_cfgHandPredictPercent = I("hand_predict_percent", 80);
+    if (g_cfgHandPredictPercent < 0) g_cfgHandPredictPercent = 0;
+    if (g_cfgHandPredictPercent > 150) g_cfgHandPredictPercent = 150;
+    g_cfgHandFilter = I("hand_filter", 1) != 0;
+    {
+        auto F = [&](const char* k, float d, float lo, float hi) {
+            char buf[32] = {};
+            GetPrivateProfileStringA("motion_aim", k, "", buf, sizeof(buf), ini.c_str());
+            float v = buf[0] ? (float)atof(buf) : d;
+            if (!(v >= lo)) v = lo;
+            if (v > hi) v = hi;
+            return v;
+        };
+        g_cfgHandFilterMinCutHz = F("hand_filter_min_cutoff_hz", 1.5f, 0.2f, 30.0f);
+        g_cfgHandFilterPosBeta = F("hand_filter_pos_beta", 12.0f, 0.0f, 200.0f);
+        g_cfgHandFilterRotBeta = F("hand_filter_rot_beta", 2.0f, 0.0f, 50.0f);
+        g_cfgHandFilterDCutHz = F("hand_filter_velocity_cutoff_hz", 5.0f, 0.5f, 30.0f);
+        g_cfgStillMps = F("hand_still_cms", 3.0f, 0.0f, 100.0f) / 100.0f;
+        g_cfgMovingMps = F("hand_moving_cms", 15.0f, 0.0f, 300.0f) / 100.0f;
+        if (g_cfgMovingMps < g_cfgStillMps) g_cfgMovingMps = g_cfgStillMps;
+        g_cfgStillRads = F("hand_still_deg_per_s", 9.0f, 0.0f, 360.0f) * kPi / 180.0f;
+        g_cfgMovingRads = F("hand_moving_deg_per_s", 45.0f, 0.0f, 720.0f) * kPi / 180.0f;
+        if (g_cfgMovingRads < g_cfgStillRads) g_cfgMovingRads = g_cfgStillRads;
+        g_cfgHandJitterLog = I("hand_jitter_log", 1) != 0;
+    }
+    DebugLogger::LogFormat("Hand smoothing: hand_filter=%d (min cutoff %.1f Hz, beta pos %.1f rot %.1f, velocity cutoff %.1f Hz) | "
+        "prediction %s at %d%%", g_cfgHandFilter ? 1 : 0, g_cfgHandFilterMinCutHz, g_cfgHandFilterPosBeta,
+        g_cfgHandFilterRotBeta, g_cfgHandFilterDCutHz,
+        g_cfgHandPredictMs < 0 ? "MEASURED (image age + half its time on screen)" : "fixed hand_predict_ms",
+        g_cfgHandPredictPercent);
     g_cfgThrowSwing = I("throw_swing", 1) != 0;
     g_cfgSwingMinMps = (float)I("throw_swing_min_cms", 120) / 100.0f;
     g_cfgSwingGain = (float)I("throw_swing_gain_percent", 100) / 100.0f;
