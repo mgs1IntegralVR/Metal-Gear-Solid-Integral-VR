@@ -12,6 +12,7 @@
 #include "../include/camera_write_hook.h"
 #include "../include/vr_aim.h"
 #include "../include/motion_aim.h"
+#include "../include/vr_settings.h"
 
 // From dllmain.cpp: injects a key state directly into the game's own
 // DirectInput keyboard GetDeviceState() read, bypassing SendInput() entirely
@@ -71,6 +72,8 @@ XrPath      g_leftHapticPath = XR_NULL_PATH, g_rightHapticPath = XR_NULL_PATH;
 // pointing ray, which is why a gun must not use it.
 XrAction    g_aimPoseAction;
 XrSpace     g_rightAimSpace;
+// Left-handed mode (2026-10-05): the gun / laser follow the LEFT controller's aim pose.
+XrSpace     g_leftAimSpace = XR_NULL_HANDLE;
 
 XrSpace     g_rightHandSpace;
 XrSpace     g_leftHandSpace;
@@ -102,6 +105,12 @@ static bool g_movementFollowsHead = true;
 static bool g_invertMovementRotation = false;
 static bool g_lookOnRightStick = true;
 static bool g_invertLookStick = false;
+// LEFT-HANDED MODE (2026-10-05, [input] left_handed). A mirror of the gun hand:
+// the gun, laser and bullets follow your LEFT controller, the left trigger
+// fires, A/B and X/Y swap, and the sticks swap (move on the right stick, turn
+// on the left). Grips and the wrist panels stay on their own hands -- they are
+// per-hand already (items left wrist, weapons right wrist).
+static bool g_leftHanded = false;
 
 // ---------------------------------------------------------------------------
 // BUTTON MAPPING, [controls] in the ini -- BY ACTION NAME (2026-09-29).
@@ -495,6 +504,11 @@ static void LoadFallbackInputConfig() {
     g_invertMovementRotation = GetPrivateProfileIntA("input", "invert_movement_rotation", 0, ini.c_str()) != 0;
     g_lookOnRightStick = GetPrivateProfileIntA("input", "look_on_right_stick", 1, ini.c_str()) != 0;
     g_invertLookStick = GetPrivateProfileIntA("input", "invert_look_stick", 0, ini.c_str()) != 0;
+    g_leftHanded = GetPrivateProfileIntA("input", "left_handed", 0, ini.c_str()) != 0;
+    SetLeftHandedHands(g_leftHanded);
+    DebugLogger::LogFormat("Handedness: %s", g_leftHanded
+        ? "LEFT-HANDED -- gun/laser on the left controller, left trigger fires, A/B<->X/Y and the sticks swapped"
+        : "right-handed");
     DebugLogger::LogFormat("Look config: look_on_right_stick=%d invert_look_stick=%d",
         g_lookOnRightStick ? 1 : 0, g_invertLookStick ? 1 : 0);
 
@@ -557,7 +571,7 @@ static void LoadFallbackInputConfig() {
         DebugLogger::LogFormat("Controls (by action): %s | menu keys (A=Enter, B=Esc)=%d | keyboard fallback=%d. "
             "Each action is pressed on whichever joystick button the game's own controller settings give it "
             "(see the 'Game controller settings' line); Codec and Pause go out as Tab / Esc. Hold L3 ~1 s in the "
-            "headset to remap on your left wrist.", m.c_str(), g_menuKeysEnabled ? 1 : 0, g_keyboardSynthEnabled ? 1 : 0);
+            "headset for VR Settings (BUTTONS tab remaps).", m.c_str(), g_menuKeysEnabled ? 1 : 0, g_keyboardSynthEnabled ? 1 : 0);
     }
 
     // ---- [melee] -----------------------------------------------------------
@@ -907,7 +921,7 @@ void InitOpenXRInput() {
     XrPath thumbstickRightPath;
     XrPath leftTriggerPath, leftSqueezePath, xClickPath, yClickPath;
     XrPath r3Path, confirmAPath, confirmTriggerPath, backBPath, backMenuPath;
-    XrPath aimPosePath;
+    XrPath aimPosePath, leftAimPosePath;
     XrPath squeezeValuePath;
     XrPath l3Path;
 
@@ -947,6 +961,7 @@ void InitOpenXRInput() {
     // interaction profile below, and the correct source for a gun ray. The
     // grip pose above runs along the handle and reads tens of degrees low.
     xrStringToPath(g_xrInstance, "/user/hand/right/input/aim/pose", &aimPosePath);
+    xrStringToPath(g_xrInstance, "/user/hand/left/input/aim/pose", &leftAimPosePath);   // left-handed mode
     xrStringToPath(g_xrInstance, "/user/hand/right/input/thumbstick/click", &r3Path);
     xrStringToPath(g_xrInstance, "/user/hand/left/input/thumbstick/click", &l3Path);
     xrStringToPath(g_xrInstance, "/user/hand/right/input/a/click", &confirmAPath);
@@ -962,6 +977,7 @@ void InitOpenXRInput() {
         {g_poseAction, posePath},
         {g_poseAction, leftPosePath},
         {g_aimPoseAction, aimPosePath},
+        {g_aimPoseAction, leftAimPosePath},
         {g_r3ClickAction, r3Path},
         // Confirm now lives on the A button, not the trigger. It used to share
         // the trigger, which is fine in a menu and wrong in gameplay: the
@@ -996,6 +1012,7 @@ void InitOpenXRInput() {
         {g_poseAction, posePath},
         {g_poseAction, leftPosePath},
         {g_aimPoseAction, aimPosePath},
+        {g_aimPoseAction, leftAimPosePath},
         {g_r3ClickAction, r3Path},
         {g_confirmAction, confirmTriggerPath},
         {g_backAction, backMenuPath},
@@ -1019,6 +1036,7 @@ void InitOpenXRInput() {
         {g_poseAction, posePath},
         {g_poseAction, leftPosePath},
         {g_aimPoseAction, aimPosePath},
+        {g_aimPoseAction, leftAimPosePath},
         {g_confirmAction, triggerClickPath},
         {g_backAction, backMenuPath},
         {g_hapticAction, g_leftHapticPath},
@@ -1041,6 +1059,7 @@ void InitOpenXRInput() {
         {g_poseAction, posePath},
         {g_poseAction, leftPosePath},
         {g_aimPoseAction, aimPosePath},
+        {g_aimPoseAction, leftAimPosePath},
         {g_confirmAction, triggerClickPath},
         {g_backAction, backMenuPath},
         {g_l3ClickAction, l3Path},
@@ -1085,6 +1104,13 @@ void InitOpenXRInput() {
     else {
         DebugLogger::Log("Aim: right-hand aim action space created");
     }
+    aimSpaceInfo.subactionPath = g_leftHandPath;
+    xr = xrCreateActionSpace(g_xrSession, &aimSpaceInfo, &g_leftAimSpace);
+    if (xr != XR_SUCCESS) {
+        DebugLogger::LogFormat("WARNING: xrCreateActionSpace(left aim) failed: %d -- left-handed mode will aim "
+            "with the right controller", (int)xr);
+        g_leftAimSpace = XR_NULL_HANDLE;
+    }
 
     XrSessionActionSetsAttachInfo attachInfo{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
     attachInfo.countActionSets = 1;
@@ -1119,9 +1145,21 @@ static void Buzz(int hand, float amplitude, int ms) {
         info.subactionPath = h ? g_rightHandPath : g_leftHandPath;
         XrHapticVibration v{ XR_TYPE_HAPTIC_VIBRATION };
         v.amplitude = amplitude;
-        v.duration = (XrDuration)ms * 1000000LL;
+        // Quest controllers over Virtual Desktop barely register pulses much
+        // shorter than this; keep every buzz long enough to feel.
+        v.duration = (XrDuration)(ms < 70 ? 70 : ms) * 1000000LL;
         v.frequency = XR_FREQUENCY_UNSPECIFIED;
-        xrApplyHapticFeedback(g_xrSession, &info, reinterpret_cast<const XrHapticBaseHeader*>(&v));
+        const XrResult r = xrApplyHapticFeedback(g_xrSession, &info, reinterpret_cast<const XrHapticBaseHeader*>(&v));
+        static int s_logs = 0, s_fails = 0;
+        if (r != XR_SUCCESS && s_fails < 10) {
+            ++s_fails;
+            DebugLogger::LogFormat("Rumble: xrApplyHapticFeedback(%s hand) FAILED: %d", h ? "right" : "left", (int)r);
+        }
+        else if (r == XR_SUCCESS && s_logs < 12) {
+            ++s_logs;
+            DebugLogger::LogFormat("Rumble: %s hand, strength %.2f, %d ms -> runtime accepted it",
+                h ? "right" : "left", amplitude, ms < 70 ? 70 : ms);
+        }
     }
 }
 static int g_tempNative = TEMP_NONE;
@@ -1578,86 +1616,15 @@ static void MeleeUpdate(bool gate, bool lTrig, bool rTrig, DWORD now, ActionOut&
     }
 }
 
-// ---- in-headset remap --------------------------------------------------------
-// Hold L3 about a second: a panel on your left wrist lists the nine buttons and
-// what each does. Press a button (or stick up/down) to pick it, stick
-// left/right to change it, click L3 to save to mgs1_vr_config.ini and close.
-// While it is open nothing reaches the game.
-static bool g_remapOpen = false;
-static int  g_remapSel = 0;
-static int  g_remapBind[IN_COUNT];
-static bool g_remapChanged = false;
-
-static void PublishRemapPanel() {
-    RemapPanelView v;
-    v.open = g_remapOpen;
-    v.count = IN_COUNT;
-    v.sel = g_remapSel;
-    v.changed = g_remapChanged;
-    for (int i = 0; i < IN_COUNT; ++i) {
-        strcpy_s(v.input[i], kPhys[i].label);
-        strcpy_s(v.action[i], ActionLabel(g_remapBind[i]));
-    }
-    SetRemapPanel(v);
-}
-
-static void RemapOpen() {
-    for (int i = 0; i < IN_COUNT; ++i) g_remapBind[i] = g_bind[i];
-    g_remapSel = 0;
-    g_remapChanged = false;
-    g_remapOpen = true;
-    DebugLogger::Log("Remap: panel OPEN on the left wrist (press a button or stick up/down to pick, "
-        "stick left/right to change, L3 to save and close)");
-    PublishRemapPanel();
-}
-
-static void LoadFallbackInputConfig();
-static void RemapSaveAndClose() {
-    g_remapOpen = false;
-    if (g_remapChanged) {
-        const std::string ini = GetGameIniPath();
-        int failed = 0;
-        for (int i = 0; i < IN_COUNT; ++i) {
-            if (!WritePrivateProfileStringA("controls", kPhys[i].iniKey, ActionKey(g_remapBind[i]), ini.c_str())) ++failed;
-        }
-        WritePrivateProfileStringA(nullptr, nullptr, nullptr, ini.c_str());   // flush the ini cache
-        if (failed) {
-            DebugLogger::LogFormat("Remap: could NOT write %d key(s) to %s (error %lu) -- using the new mapping for "
-                "this session only", failed, ini.c_str(), GetLastError());
-            for (int i = 0; i < IN_COUNT; ++i) g_bind[i] = g_remapBind[i];
-        }
-        else {
-            DebugLogger::LogFormat("Remap: saved to %s", ini.c_str());
-            LoadFallbackInputConfig();
-        }
-    }
-    else DebugLogger::Log("Remap: closed, nothing changed");
-    PublishRemapPanel();
-}
-
-static void RemapUpdate(const bool down[IN_COUNT], float sx, float sy, DWORD now) {
-    static bool prev[IN_COUNT] = {};
-    static DWORD lastV = 0, lastH = 0;
-    static int vdir = 0, hdir = 0;
-    for (int i = 0; i < IN_COUNT; ++i) {
-        if (down[i] && !prev[i]) g_remapSel = i;   // "press the button you want to change"
-        prev[i] = down[i];
-    }
-    const int nv = sy > 0.6f ? -1 : (sy < -0.6f ? 1 : 0);
-    const int nh = (std::fabs(sx) > std::fabs(sy)) ? (sx > 0.6f ? 1 : (sx < -0.6f ? -1 : 0)) : 0;
-    if (nv != 0 && (nv != vdir || now - lastV >= 250)) {
-        g_remapSel = (g_remapSel + nv + IN_COUNT) % IN_COUNT;
-        lastV = now;
-    }
-    vdir = nv;
-    if (nh != 0 && (nh != hdir || now - lastH >= 300)) {
-        const int k = (ActionIndex(g_remapBind[g_remapSel]) + nh + kActionCount) % kActionCount;
-        g_remapBind[g_remapSel] = kActions[k].act;
-        g_remapChanged = true;
-        lastH = now;
-    }
-    hdir = nh;
-    PublishRemapPanel();
+// ---- in-headset VR Settings (2026-10-05) -------------------------------------
+// Hold L3 about a second: the VR Settings panel (vr_settings.cpp) opens in
+// front of you -- in gameplay, the pause menu or the title screen. Its BUTTONS
+// tab replaces the old left-wrist remap panel. While it is open nothing
+// reaches the game.
+void ReloadInputConfigLive() {
+    const bool wasOn = g_hapticsEnabled;
+    LoadFallbackInputConfig();
+    if (g_hapticsEnabled && !wasOn) Buzz(2, 0.7f, 150);   // switched on in the panel: you feel it work
 }
 
 void UpdateOpenXRInput(XrTime predictedTime) {
@@ -1758,6 +1725,30 @@ void UpdateOpenXRInput(XrTime predictedTime) {
     physDown[IN_LTRIG] = Down(lTrigState);
     physDown[IN_LGRIP] = Down(lGripState);
     physDown[IN_LMENU] = Down(radioState);
+    // Left-handed: mirror the trigger and face buttons, and swap the sticks.
+    // Everything below (bindings, settings panel, twin-stick) then sees the
+    // left trigger as "R TRIG", X as "A", the right stick as the move stick.
+    if (g_leftHanded) {
+        std::swap(physDown[IN_RTRIG], physDown[IN_LTRIG]);
+        std::swap(physDown[IN_A], physDown[IN_X]);
+        std::swap(physDown[IN_B], physDown[IN_Y]);
+        std::swap(stickState, lookState);
+    }
+
+    // ---- rumble for shots and knocks (2026-10-05) ---------------------------
+    // motion_aim.cpp sees them on the game thread; the haptics live here.
+    {
+        const int shot = MotionAimTakeShotRumble();
+        if (shot) {
+            const int gunHand = g_leftHanded ? 0 : 1;   // Buzz: 0 left, 1 right
+            if (shot == 2)      Buzz(gunHand, 1.0f, 160);   // Nikita / Stinger launch
+            else if (shot == 3) Buzz(gunHand, 0.5f, 70);    // grenade / stun / chaff leaves the hand
+            else                Buzz(gunHand, 0.9f, 80);    // a round fired
+        }
+        const int knock = MotionAimTakeKnockRumble();
+        if (knock & 1) Buzz(1, 0.8f, 80);
+        if (knock & 2) Buzz(0, 0.8f, 80);
+    }
 
     // Hands, located now so the gestures below can use this frame's poses.
     XrSpaceLocation rightHandLoc{ XR_TYPE_SPACE_LOCATION };
@@ -1777,21 +1768,22 @@ void UpdateOpenXRInput(XrTime predictedTime) {
     const bool haveCfg = ReadPadConfig(padCfg);
     if (haveCfg) LogPadConfigIfChanged(padCfg);
 
-    // ---- L3: tap = reload the ini, hold ~1 s = remap panel ----------------------
+    // ---- L3: tap = reload the ini, hold ~1 s = VR Settings panel -------------
     // Tap still re-reads [controls]/[input] (as since 2026-08-15). Holding it
-    // opens the remap panel; with the panel open, a tap saves and closes.
+    // opens VR Settings; with the panel open, a tap closes it (saving first).
     {
         static DWORD l3Down = 0;
         static bool l3Consumed = false;
         const bool l3 = Down(l3State);
         if (l3 && !l3Down) { l3Down = nowTick ? nowTick : 1; l3Consumed = false; }
-        if (l3 && !l3Consumed && !g_remapOpen && nowTick - l3Down >= 900) {
+        if (l3 && !l3Consumed && !VrSettingsIsOpen() && nowTick - l3Down >= 900) {
             l3Consumed = true;
-            RemapOpen();
+            VrSettingsOpen();
+            Buzz(2, 0.5f, 80);   // the panel opened (also a quick check that rumble works)
         }
         if (!l3 && l3Down) {
             if (!l3Consumed) {
-                if (g_remapOpen) RemapSaveAndClose();
+                if (VrSettingsIsOpen()) VrSettingsClose();
                 else {
                     LoadFallbackInputConfig();
                     DebugLogger::Log("L3: live-reloaded [controls]/[input] from mgs1_vr_config.ini");
@@ -1806,10 +1798,34 @@ void UpdateOpenXRInput(XrTime predictedTime) {
     ActionOut out;
     bool wantEnter = false, wantEscape = false;
 
-    if (g_remapOpen) {
-        // Nothing reaches the game while the panel is up.
-        RemapUpdate(physDown, stickState.isActive ? stickState.currentState.x : 0.0f,
-                    stickState.isActive ? stickState.currentState.y : 0.0f, nowTick);
+    // Buttons still held when the panel closes (the B that closed it) must
+    // not reach the game on release: swallow everything until all are up.
+    static bool s_settingsWasOpen = false, s_settingsSwallow = false;
+    const bool settingsOpen = VrSettingsIsOpen();
+    if (s_settingsWasOpen && !settingsOpen) s_settingsSwallow = true;
+    s_settingsWasOpen = settingsOpen;
+    if (s_settingsSwallow) {
+        bool any = false;
+        for (int i = 0; i < IN_COUNT; ++i) any = any || physDown[i];
+        if (!any) s_settingsSwallow = false;
+    }
+
+    if (settingsOpen || s_settingsSwallow) {
+        // Nothing reaches the game while the panel is up. Either stick drives
+        // it -- whichever is pushed further.
+        VrSettingsInput si;
+        float lx = stickState.isActive ? stickState.currentState.x : 0.0f;
+        float ly = stickState.isActive ? stickState.currentState.y : 0.0f;
+        float rx = lookState.isActive ? lookState.currentState.x : 0.0f;
+        float ry = lookState.isActive ? lookState.currentState.y : 0.0f;
+        if (rx * rx + ry * ry > lx * lx + ly * ly) { lx = rx; ly = ry; }
+        si.sx = lx; si.sy = ly;
+        si.a = physDown[IN_A];
+        si.b = physDown[IN_B];
+        si.y = physDown[IN_Y];
+        si.lTrig = physDown[IN_LTRIG];
+        si.rTrig = physDown[IN_RTRIG];
+        if (settingsOpen) VrSettingsUpdate(si, nowTick);
         ReleaseOpenXrDirectionalKeys();
         PublishMoveStickActive(false);
         bool noGrip = false;
@@ -1917,14 +1933,18 @@ void UpdateOpenXRInput(XrTime predictedTime) {
         const bool wallOwnsRightGrip = WallGripUpdate(gripR, stickMag, nowTick, grabStartsWallPress);
 
         bool wristOwnsLeft = false, wristOwnsRight = false;
+        // Each wrist list scrolls with the stick on ITS OWN hand (grips are not
+        // mirrored in left-handed mode, the sticks are).
+        XrActionStateVector2f& handStickL = g_leftHanded ? lookState : stickState;
+        XrActionStateVector2f& handStickR = g_leftHanded ? stickState : lookState;
         WristSelectInput(gripL, gripR && !wallOwnsRightGrip,
-                         stickState.isActive ? stickState.currentState.x : 0.0f,
-                         stickState.isActive ? stickState.currentState.y : 0.0f,
-                         lookState.isActive ? lookState.currentState.x : 0.0f,
-                         lookState.isActive ? lookState.currentState.y : 0.0f,
+                         handStickL.isActive ? handStickL.currentState.x : 0.0f,
+                         handStickL.isActive ? handStickL.currentState.y : 0.0f,
+                         handStickR.isActive ? handStickR.currentState.x : 0.0f,
+                         handStickR.isActive ? handStickR.currentState.y : 0.0f,
                          &wristOwnsLeft, &wristOwnsRight);
-        if (wristOwnsLeft)  { stickState.currentState.x = 0.0f; stickState.currentState.y = 0.0f; }
-        if (wristOwnsRight) { lookState.currentState.x = 0.0f;  lookState.currentState.y = 0.0f; }
+        if (wristOwnsLeft)  { handStickL.currentState.x = 0.0f; handStickL.currentState.y = 0.0f; }
+        if (wristOwnsRight) { handStickR.currentState.x = 0.0f; handStickR.currentState.y = 0.0f; }
 
         // ---- WALL PRESS (mode 3): hold X ------------------------------------------
         static bool s_wallDirect = false;      // the stick below is already in the game's frame
@@ -2222,9 +2242,10 @@ void UpdateOpenXRInput(XrTime predictedTime) {
     // ---- publish the right controller's AIM pose ---------------------------
     // Located at the SAME predictedTime as the head pose. Deliberately NOT
     // filtered: smoothing an aim ray only adds lag. BOTH validity bits needed.
-    if (g_rightAimSpace != XR_NULL_HANDLE) {
+    const XrSpace aimSpace = (g_leftHanded && g_leftAimSpace != XR_NULL_HANDLE) ? g_leftAimSpace : g_rightAimSpace;
+    if (aimSpace != XR_NULL_HANDLE) {
         XrSpaceLocation aimLoc{ XR_TYPE_SPACE_LOCATION };
-        xrLocateSpace(g_rightAimSpace, g_xrPlaySpace, predictedTime, &aimLoc);
+        xrLocateSpace(aimSpace, g_xrPlaySpace, predictedTime, &aimLoc);
         const bool aimValid =
             (aimLoc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
             (aimLoc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
@@ -2245,8 +2266,17 @@ void UpdateOpenXRInput(XrTime predictedTime) {
         dummy.orientation.w = 1.0f;
         PublishControllerAim(dummy, false);
     }
+    // Left-handed: the gun took the left aim pose above, so Snake's right hand
+    // model gets the right controller's aim pose here (its usual source).
+    if (g_leftHanded && g_rightAimSpace != XR_NULL_HANDLE) {
+        XrSpaceLocation rl{ XR_TYPE_SPACE_LOCATION };
+        xrLocateSpace(g_rightAimSpace, g_xrPlaySpace, predictedTime, &rl);
+        const bool ok = (rl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT) &&
+                        (rl.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT);
+        MotionAimPublishRightHandAim(rl.pose, ok);
+    }
     PublishControllerGrips(leftHandLoc.pose, leftValid, rightHandLoc.pose, rightValid,
-                           physDown[IN_LGRIP] && !g_remapOpen, physDown[IN_RGRIP] && !g_remapOpen && g_tempNative != TEMP_WALL);
+                           physDown[IN_LGRIP] && !VrSettingsIsOpen(), physDown[IN_RGRIP] && !VrSettingsIsOpen() && g_tempNative != TEMP_WALL);
 }
 
 void UpdateFallbackXInput() {

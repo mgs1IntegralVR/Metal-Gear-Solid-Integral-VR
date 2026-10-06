@@ -179,6 +179,7 @@
     <ClCompile Include="src\vr_aim.cpp" />
     <ClCompile Include="src\vr_injection.cpp" />
     <ClCompile Include="src\vr_input.cpp" />
+    <ClCompile Include="src\vr_settings.cpp" />
     <ClCompile Include="third-party\minhook\src\buffer.c" />
     <ClCompile Include="third-party\minhook\src\hook.c" />
     <ClCompile Include="third-party\minhook\src\trampoline.c" />
@@ -196,6 +197,7 @@
     <ClInclude Include="include\motion_aim.h" />
     <ClInclude Include="include\offsets.h" />
     <ClInclude Include="include\vr_aim.h" />
+    <ClInclude Include="include\vr_settings.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

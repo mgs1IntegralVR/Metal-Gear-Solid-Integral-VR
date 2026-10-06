@@ -78,6 +78,15 @@ bool IsGunInHandActive();
 // XR thread, once per frame: the LEFT controller's grip pose, for Snake's left
 // hand ([hands] in the ini). Called from PublishControllerGrips.
 void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid);
+// Left-handed mode: the RIGHT controller's aim pose, for Snake's right hand
+// model (the gun / MotionAimPublishXrFrame then carries the LEFT aim pose).
+void MotionAimPublishRightHandAim(const XrPosef& aim, bool valid);
+void MotionAimSetLeftHanded(bool leftHanded);
+// Rumble requests, taken (and cleared) once per XR frame by vr_input.cpp.
+// Shot: 0 none, 1 bullet, 2 missile (Nikita / Stinger), 3 throw.
+// Knock: bit 0 = right hand, bit 1 = left hand.
+int MotionAimTakeShotRumble();
+int MotionAimTakeKnockRumble();
 
 // True once installed, enabled and fully calibrated (i.e. shots are being
 // redirected, not just observed).

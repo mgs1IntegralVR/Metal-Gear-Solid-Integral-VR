@@ -160,6 +160,10 @@ struct RemapPanelView {
 };
 void SetRemapPanel(const RemapPanelView& view);
 
+// Left-handed mode: forwards to motion_aim (gun in the left hand, both hand
+// models kept on their own controllers).
+void SetLeftHandedHands(bool leftHanded);
+
 // Close a wrist quick-select list without equipping (0 = items, 1 = weapons).
 void WristSelectCancel(int side);
 

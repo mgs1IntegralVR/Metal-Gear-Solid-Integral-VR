@@ -20,6 +20,7 @@
 #include "../include/vr_aim.h"
 #include "../include/motion_aim.h"
 #include "../include/render_twice.h"
+#include "../include/vr_settings.h"
 
 #pragma comment(lib, "xinput9_1_0.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -1523,6 +1524,36 @@ static void LoadRuntimeConfig() {
         g_enableRealCameraWrite ? 1 : 0,
         g_useIncrementalCameraWrite ? 1 : 0,
         (int)g_maxCameraStepPerFrame);
+}
+
+// In-headset VR Settings panel (2026-10-05): re-read the picture options it
+// offers. Not LoadRuntimeConfig() itself -- that also rebuilds the HUD magnify
+// region list the render path iterates, and re-runs every other loader. All of
+// these are scalars read per frame on this same XR frame thread.
+void ReloadDisplayLiveSettings() {
+    const char* ini = g_iniPath.c_str();
+    {
+        const int fp = (int)GetPrivateProfileIntA("openxr", "frame_pacing", 2, ini);
+        g_framePacing = fp != 0;
+        g_framePacingMode = fp == 1 ? 1 : 2;
+    }
+    int aa = (int)GetPrivateProfileIntA("openxr", "post_aa_percent", 100, ini);
+    aa = aa < 0 ? 0 : (aa > 100 ? 100 : aa);
+    g_postAaAmount = (float)aa / 100.0f;
+    int sp = (int)GetPrivateProfileIntA("openxr", "sharpen_percent", 40, ini);
+    sp = sp < 0 ? 0 : (sp > 100 ? 100 : sp);
+    g_sharpenAmount = (float)sp / 100.0f;
+    float d = (float)GetPrivateProfileIntA("openxr", "native_screen_distance_cm", 250, ini) / 100.0f;
+    if (d < 0.5f) d = 0.5f;
+    if (d > 15.0f) d = 15.0f;
+    float w = (float)GetPrivateProfileIntA("openxr", "native_screen_width_cm", 320, ini) / 100.0f;
+    if (w < 0.3f) w = 0.3f;
+    if (w > 30.0f) w = 30.0f;
+    if (d != g_nativeScreenDistanceM) g_nativeScreenPosed = false;   // re-place it at the new distance next frame
+    g_nativeScreenDistanceM = d;
+    g_nativeScreenWidthM = w;
+    DebugLogger::LogFormat("Display live settings: frame_pacing=%d post_aa=%d%% sharpen=%d%% virtual screen %.2f m wide at %.2f m",
+        !g_framePacing ? 0 : g_framePacingMode, aa, sp, w, d);
 }
 
 static void UpdateOverlayWindowTitle(int frame) {
@@ -3133,6 +3164,7 @@ static void BlitMonoTextureToEyeSwapchain(uint32_t eye, ID3D11Texture2D* dstText
 static void CleanupOpenXrRenderTargets() {
     ShutdownAimLaser();
     ShutdownWristHud();
+    ShutdownVrSettingsPanel();
 
     if (g_xrMonoCaptureRTV) { g_xrMonoCaptureRTV->Release(); g_xrMonoCaptureRTV = nullptr; }
     if (g_xrMonoCaptureTexture) {
@@ -3392,6 +3424,9 @@ static bool InitializeOpenXrRenderTargets() {
         InitAimLaser(g_xrSession, g_xrPlaySpace, g_xrD3DDevice, g_xrD3DContext);
     }
     InitWristHud(g_xrSession, g_xrPlaySpace, g_xrD3DDevice, g_xrD3DContext);
+    // The in-headset VR Settings panel (hold L3). Its own swapchain, so it
+    // works with the wrist HUD switched off. Fail-soft like the two above.
+    InitVrSettingsPanel(g_xrSession, g_xrPlaySpace, g_xrD3DDevice, g_xrD3DContext);
 
     DebugLogger::LogFormat(
         "OpenXR projection rendering initialized: format=%d left=%dx%d right=%dx%d",
@@ -4330,6 +4365,12 @@ static DWORD WINAPI XrFrameThreadProc(LPVOID) {
             // Wrist HUD (LIFE on the left wrist, weapon on the right). Same
             // rules as the laser: VR mode only, never over a menu screen.
             BuildWristHudLayers(frameState.predictedDisplayTime, g_xrViews[0].pose, layers);
+        }
+        // VR Settings panel (hold L3): on top of everything, and -- unlike the
+        // laser and wrist -- in every mode, so it works from the pause menu,
+        // the title screen and the flat virtual screen.
+        if (locateResult == XR_SUCCESS && viewCountOutput > 0) {
+            BuildVrSettingsLayers(g_xrViews[0].pose, layers);
         }
 
         endInfo.layerCount = (uint32_t)layers.size();

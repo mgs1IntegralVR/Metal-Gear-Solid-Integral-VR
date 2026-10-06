@@ -2036,6 +2036,7 @@ void LoadCameraHookConfig() {
     LoadScopeConfig();
 }
 
+
 inline float NormalizeRad(float a) {
     while (a > kPi)  a -= kTwoPi;
     while (a < -kPi) a += kTwoPi;
@@ -2149,6 +2150,33 @@ inline bool ReadFpvFlag() {
 }
 
 } // namespace
+
+// In-headset VR Settings panel (2026-10-05): re-read ONLY the end-user options
+// it offers. LoadCameraHookConfig() itself is not re-run live -- it also resets
+// diagnostic scan state and the Snake model hash list the game thread reads.
+// Defined OUTSIDE the anonymous namespace (vr_settings.cpp links to it).
+// Each of these is a plain int/bool the game thread reads per frame, so a
+// change lands on the next game frame.
+void ReloadCameraHookLiveSettings() {
+    const std::string ini = GetGameIniPath();
+    auto I = [&](const char* k, int d) { return GetPrivateProfileIntA("camera_hook", k, d, ini.c_str()); };
+    g_csView = I("cutscene_view", 1) != 0 ? 1 : 0;
+    int bf = I("body_follows_head", 1);
+    if (bf < 0 || bf > 2) bf = 1;
+    g_bodyFollowsHead = bf;
+    int ns = I("cutscene_pov_no_snake", 2);
+    if (ns < 0 || ns > 2) ns = 2;
+    g_csPovNoSnake = ns;
+    g_csLetterbox = I("cutscene_pov_letterbox", 0);
+    g_csSubPanel = I("cutscene_pov_subtitle_panel", 1) != 0;
+    g_gpPovStickFollowsView = I("gameplay_pov_stick_follows_view", 1);
+    g_gpPovRightStickTurn = I("gameplay_pov_right_stick_turn", 1);
+    DebugLogger::LogFormat("Camera live settings: body_follows_head=%d", g_bodyFollowsHead);
+    DebugLogger::LogFormat("Camera live settings: cutscene_view=%d no_snake=%d letterbox=%d caption_panel=%d "
+        "stick_follows_view=%d right_stick_turn=%d",
+        g_csView, g_csPovNoSnake, g_csLetterbox, g_csSubPanel ? 1 : 0, g_gpPovStickFollowsView, g_gpPovRightStickTurn);
+    LoadScopeConfig();
+}
 
 // ===========================================================================
 // ROTATION hook body. Runs on the game's thread, once per game frame.

@@ -422,6 +422,9 @@ float GetScopeDisplayDeg();
 float GetScopeRaiseDistanceM();
 float GetScopeLowerDistanceM();
 void LoadScopeConfig();
+// Re-reads the end-user [camera_hook] options the VR Settings panel offers
+// (cutscene view, Snake's-eyes stick options) plus [scope]. XR or any thread.
+void ReloadCameraHookLiveSettings();
 
 // Snake's position ([actor+0x20], int16 x,y,z) from the actor the engine
 // handed its first-person camera routine. False before first person has run

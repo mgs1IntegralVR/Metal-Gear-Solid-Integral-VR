@@ -3,11 +3,13 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cstdio>
 #include <atomic>
 #include <string>
 #include <openxr/openxr.h>
 
 #include "../include/motion_aim.h"
+#include "../include/crash_report.h"
 #include "../include/camera_write_hook.h"
 #include "../include/debug_logging.h"
 
@@ -163,7 +165,17 @@ struct AimSnap {
 bool g_cfgRenderHeadFrame = true;    // [motion_aim] hand_relative_to_render_pose
 // --- left controller snapshot (published from the XR thread) ----------------
 AimSnap  g_snapL;
-struct { bool have = false; float pos[3]{}; LONGLONG qpc = 0; float vel[3]{}; } g_velTrackL;
+struct VelTrackT { bool have = false; float pos[3]{}; LONGLONG qpc = 0; float vel[3]{}; };
+VelTrackT g_velTrackL;
+// --- left-handed mode (2026-10-05) ------------------------------------------
+// g_snap (the gun, bullets, laser) then comes from the LEFT controller's aim
+// pose, so Snake's RIGHT hand needs its own source: the right controller's aim
+// pose, published here. With it, both hand models keep exactly the controller
+// pose + calibration they have in right-handed mode -- left mesh on the left
+// grip, right mesh on the right aim -- and only the gun changes hands.
+bool      g_leftHanded = false;
+AimSnap   g_snapRH;
+VelTrackT g_velTrackRH;
 XrPosef  g_lastHead{};
 bool     g_haveHead = false;
 // play-space velocity tracking (XR thread only)
@@ -176,6 +188,11 @@ struct EyeImage {
 } g_eyeImg[2];
 
 std::atomic<LONGLONG> g_lastFireQpc{ 0 };
+// Rumble requests for vr_input.cpp (XR thread), which owns the haptics.
+// Shot: 0 none, 1 bullet, 2 missile, 3 throw (the strongest wins until taken).
+// Knock: bit 0 = right hand, bit 1 = left hand.
+std::atomic<int> g_shotRumble{ 0 };
+std::atomic<int> g_knockRumble{ 0 };
 
 // --- calibration -------------------------------------------------------------
 std::atomic<int> g_rightSign{ 0 };   // resolved sign, 0 = not yet
@@ -257,7 +274,7 @@ V3 EuroStep(Euro3& f, V3 raw, float dt, float minCut, float beta, float dCut) {
     return f.x;
 }
 struct HandEuro { Euro3 pos, dir, up; LONGLONG qpc = 0; };
-HandEuro g_euroR, g_euroL;
+HandEuro g_euroR, g_euroL, g_euroRH;
 
 // Runs the filter on one play-space controller sample and stores the result in
 // the snapshot (caller holds g_lock exclusively).
@@ -599,6 +616,9 @@ void MotionAimPublishEyeImage(unsigned eye, const XrFovf& fov,
     }
 }
 
+int MotionAimTakeShotRumble() { return g_shotRumble.exchange(0, std::memory_order_relaxed); }
+int MotionAimTakeKnockRumble() { return g_knockRumble.exchange(0, std::memory_order_relaxed); }
+
 void MotionAimNoteFireButton(bool down) {
     if (down) g_lastFireQpc.store(NowQpc(), std::memory_order_relaxed);
 }
@@ -620,6 +640,42 @@ extern "C" void __cdecl MotionAimAllocBody(uint32_t* stack) {
     for (int i = 0; i < kSiteCount; ++i) if (g_sites[i].installed && g_sites[i].retAddr == ret) site = i;
     if (site < 0) return;
     g_sites[site].hits++;
+
+    // ---- rumble on the player's own shot (2026-10-05) ----------------------
+    // Fire button pressed within the window AND the projectile starts nearEye
+    // your eye (an enemy firing while you hold the trigger starts elsewhere).
+    // Checked here, before anything below can stand down, so it works with
+    // the gun in your hand, the scope, the Stinger and throws alike.
+    if (GameplayGate()) {
+        const bool throwSite = g_sites[site].kind == 1;
+        const double win = (double)g_cfgFireWindowMs + g_sites[site].extraWindowMs + (throwSite ? 600.0 : 0.0);
+        const bool pressed = g_cfgFireWindowMs <= 0 ||
+            MsSince(g_lastFireQpc.load(std::memory_order_relaxed)) <= win;
+        V3 eye{}, look{};
+        if (pressed && ReadV16(kViewFromRva, &eye) && ReadV16(kViewToRva, &look)) {
+            bool nearEye = false;
+            if (throwSite) {
+                uint32_t posP = 0; int16_t pos[3];
+                if (SafeRead(&posP, stack + 8, 4) && posP && SafeRead(pos, (const void*)(uintptr_t)posP, 6))
+                    nearEye = Len(Sub(V3{ (float)pos[0], (float)pos[1], (float)pos[2] }, eye)) <= g_cfgPlayerRadius;
+            }
+            else {
+                for (int i = 1; i < 192 && !nearEye; ++i) {
+                    uint32_t p = 0;
+                    if (!SafeRead(&p, stack + i, 4)) break;
+                    if (p < 0x10000 || p > 0x7FFE0000 || (p & 1)) continue;
+                    GameMatrix c;
+                    if (!SafeRead(&c, (const void*)(uintptr_t)p, sizeof(c)) || !LooksLikeRotation(c)) continue;
+                    nearEye = Len(Sub(V3{ (float)c.t[0], (float)c.t[1], (float)c.t[2] }, eye)) <= g_cfgPlayerRadius;
+                }
+            }
+            if (nearEye) {
+                const int kind = throwSite ? 3 : (g_sites[site].extraWindowMs > 0 ? 2 : 1);
+                int cur = g_shotRumble.load(std::memory_order_relaxed);
+                while (kind > cur && !g_shotRumble.compare_exchange_weak(cur, kind)) {}
+            }
+        }
+    }
 
     // ---- thrown objects: NewTenage(SVECTOR* pos, SVECTOR* step, ...) --------
     // Stack at this point (0x5A1135 has an ebp frame and pushes ebx/esi/edi):
@@ -1056,7 +1112,7 @@ double HandPredictHorizonMs() {
 //                      pitch/yaw/roll applied in the hand's own frame)
 //   headOut   : the head centre FROM was nudged away from, for collision rays
 bool BuildControllerMatrix(AimSnap s, bool gunOffset, float rollDeg, const float* rotDeg,
-                           GameMatrix* M, float* reachM, V3* headOut) {
+                           GameMatrix* M, float* reachM, V3* headOut, V3* fwdOut = nullptr) {
     const int sx = g_rightSign.load(), sy = g_upSign.load();
     if (sx == 0 || sy == 0) return false;
 
@@ -1160,6 +1216,7 @@ bool BuildControllerMatrix(AimSnap s, bool gunOffset, float rollDeg, const float
     // Undo the nudge so the gun hangs off the head centre like the world does.
     from = HeadCentreFromEye(from, R);
     if (headOut) *headOut = from;
+    if (fwdOut) *fwdOut = F;
 
     const int clip = ReadClipDistance();
     float ax, bx, ay, by;
@@ -1377,6 +1434,22 @@ int   h_knockPower = 100, h_knockLength = 16;   // what the game's knock raises
 int16_t h_lastHitAttr = 0;       // surface attribute of the most recent LineHit
 int   h_logLines = 40;
 
+// --- [hands] full body + arm IK (2026-10-04) ----------------------------------
+// full_body=1: instead of folding Snake's body into his hands, draw all of it
+// in its animated pose, hide only the head and neck (the camera sits inside
+// them), and bend each arm with two-bone IK so the shoulder (from the
+// animation) reaches the hand (at your controller). Render scratch only --
+// game logic never sees any of it, exactly like the hands.
+bool  h_fullBody = false;
+int   h_hideParts[8] = { 5, 6, -1, -1, -1, -1, -1, -1 };   // head + neck by default
+int   h_hidePartsN = 2;
+float h_elbowOut = 0.5f;         // elbow pole: 1.0 toward the feet + this much outward
+int   h_ikLogLines = 12;
+int   h_parent[40];              // part -> parent part, filled by ValidateBody
+int   h_upR = -1, h_upL = -1;    // upper-arm parts (parents of the forearms)
+unsigned h_ikFrames = 0, h_ikOverReach = 0;
+int   h_ikLogs = 0;
+
 bool  h_hooked = false, h_readOk = false, h_disabledRuntime = false;
 uint8_t* h_callSite = nullptr;
 int32_t  h_callOrigRel = 0;
@@ -1390,6 +1463,7 @@ struct HandsFrame {
     bool haveR = false, haveL = false;
     GameMatrix R{}, L{};
     bool gunValid = false; GameMatrix gun{}; float gunReach = 0;
+    bool haveHead = false; V3 head{}, fwd{};   // head point + view forward the hands were built from
     LONGLONG qpc = 0;
 } g_hf;
 LONGLONG h_seenQpc = 0;          // wrapper last saw the body (render reached it)
@@ -1589,6 +1663,7 @@ void DoKnock(V3 p, int hand, int16_t attr) {
         SafeWrite((void*)(g_base + kNoisePosRva), &pos, 8);
     }
     ++h_knocks;
+    g_knockRumble.fetch_or(hand ? 2 : 1, std::memory_order_relaxed);   // vr_input buzzes that hand
     if (h_knocks <= 30)
         DebugLogger::LogFormat("Knock[%u]: %s hand at (%d,%d,%d) surface 0x%04X sound id 0x%02X%s, noise power %d length %d",
             h_knocks, hand ? "left" : "right", pos.x, pos.y, pos.z, (unsigned)(uint16_t)attr, id,
@@ -1637,6 +1712,15 @@ bool ValidateBody(uint32_t objs, int* nOut) {
         "(parent %d) -- %s", objs, (int)n, h_partR, parentOf(h_partR), h_partL, parentOf(h_partL),
         ok ? "arm chains MATCH, hands armed" : "MISMATCH, hands stay off (set hands_right_part/left_part)");
     if (!ok) { rejected = objs; return false; }
+    for (int i = 0; i < 40; ++i) h_parent[i] = (i < n) ? parentOf(i) : -99;
+    h_upR = parentOf(h_foreR); h_upL = parentOf(h_foreL);
+    {
+        char tree[256] = {}; int len = 0;
+        for (int i = 0; i < n && len < 240; ++i)
+            len += sprintf_s(tree + len, sizeof(tree) - len, "%d<%d ", i, (int)h_parent[i]);
+        DebugLogger::LogFormat("FullBody: part tree (part<parent): %s| arms R %d->%d->%d, L %d->%d->%d | full_body=%d",
+            tree, h_upR, h_foreR, h_partR, h_upL, h_foreL, h_partL, h_fullBody ? 1 : 0);
+    }
     // Split the collapsed body between the two wrists. Parts that belong only
     // to the left arm (ancestors of the left hand that are not ancestors of the
     // right hand) sit on the left wrist; everything else on the right wrist.
@@ -1681,26 +1765,32 @@ void HandsSnakePost(uint32_t work, uint32_t bodyOverride = 0) {
     const bool bodyOk = objs && ValidateBody(objs, &n);
 
     if (gate && (h_enabled || h_gunCollision || h_collision)) {
-        AimSnap sR, sL;
+        // sG = the gun (and bullets). sR / sL = Snake's right / left hand
+        // models. Right-handed: the gun IS the right hand. Left-handed: the
+        // gun follows the left controller and travels with the LEFT hand,
+        // while the right hand model takes the right controller's aim pose.
+        AimSnap sG, sR, sL;
         AcquireSRWLockShared(&g_lock);
-        sR = g_snap; sL = g_snapL;
+        sG = g_snap; sL = g_snapL;
+        sR = g_leftHanded ? g_snapRH : g_snap;
         ReleaseSRWLockShared(&g_lock);
+        const int gunHand = g_leftHanded ? 1 : 0;   // index into hands[] below
 
-        V3 head{};
+        V3 head{}, fwd{};
         GameMatrix R{}, L{};
         float reachR = 0, reachL = 0;
-        const bool haveR = BuildControllerMatrix(sR, false, 0.0f, h_rotR, &R, &reachR, &head);
-        V3 headL{};
-        const bool haveL = BuildControllerMatrix(sL, false, 0.0f, h_rotL, &L, &reachL, &headL);
-        if (!haveR && haveL) head = headL;
+        const bool haveR = BuildControllerMatrix(sR, false, 0.0f, h_rotR, &R, &reachR, &head, &fwd);
+        V3 headL{}, fwdL{};
+        const bool haveL = BuildControllerMatrix(sL, false, 0.0f, h_rotL, &L, &reachL, &headL, &fwdL);
+        if (!haveR && haveL) { head = headL; fwd = fwdL; }
         if (haveR) ApplyHandOffset(R, h_offR);
         if (haveL) ApplyHandOffset(L, h_offL);
 
         // The gun, built as it always was, then carried along by any
         // correction the right hand receives.
         GameMatrix G{}; float gReach = 0;
-        const bool haveG = BuildControllerMatrix(sR, true, g_cfgGunRollDeg, nullptr, &G, &gReach, nullptr);
-        if (haveG && haveR) HandJitterSample(sR, G, head);
+        const bool haveG = BuildControllerMatrix(sG, true, g_cfgGunRollDeg, nullptr, &G, &gReach, nullptr);
+        if (haveG && haveR && !g_leftHanded) HandJitterSample(sG, G, head);
 
         const uint32_t hzd = (h_collision && !h_disabledRuntime) ? CurrentHzd() : 0;
         if (hzd) {
@@ -1713,7 +1803,7 @@ void HandsSnakePost(uint32_t work, uint32_t bodyOverride = 0) {
                 const bool touch = ClampToWorld(hzd, head, *hands[h]);
                 const int16_t attr = h_lastHitAttr;
                 if (touch) { ++h_contacts; h_touchTick[h].store(GetTickCount64(), std::memory_order_relaxed); }
-                if (h == 0 && haveG) SetT(G, Add(MatT(G), Sub(MatT(R), before)));
+                if (h == gunHand && haveG) SetT(G, Add(MatT(G), Sub(MatT(*hands[h]), before)));
                 if (touch && !h_contact[h] && h_knock) {
                     const float* v = snaps[h]->wvel;
                     const float speed = std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]);
@@ -1738,7 +1828,8 @@ void HandsSnakePost(uint32_t work, uint32_t bodyOverride = 0) {
                     if (back > 0.0f) {
                         const V3 shift = Mul(fwd, -back);
                         SetT(G, Add(grip, shift));
-                        if (haveR) SetT(R, Add(MatT(R), shift));
+                        if (gunHand == 0 && haveR) SetT(R, Add(MatT(R), shift));
+                        if (gunHand == 1 && haveL) SetT(L, Add(MatT(L), shift));
                         ++h_gunPushes;
                     }
                 }
@@ -1754,6 +1845,7 @@ void HandsSnakePost(uint32_t work, uint32_t bodyOverride = 0) {
         if (haveG) { g_hf.gunValid = true; g_hf.gun = G; g_hf.gunReach = gReach; }
         g_hf.haveR = haveR; g_hf.haveL = haveL;
         g_hf.R = R; g_hf.L = L;
+        g_hf.haveHead = haveR || haveL; g_hf.head = head; g_hf.fwd = fwd;
         g_hf.bodyObjs = objs; g_hf.nParts = n;
         g_hf.active = h_hooked && h_enabled && bodyOk && (haveR || haveL);
         g_hf.qpc = NowQpc();
@@ -1829,11 +1921,254 @@ bool HandsFreshGunMatrix(GameMatrix* M, float* reachM) {
 // Render: rewrite the body's part world matrices just before they become
 // screen matrices. Runs once per render pass (twice per frame with render
 // twice), always on the game thread.
+// --- FULL BODY: two-bone arm IK in render scratch (2026-10-04, v2 2026-10-05) --
+// v2, after the first headset test:
+//  * "left elbow all twisted": each bone used to be re-aimed by its own
+//    minimal rotation, so upper arm and forearm picked different twists and
+//    the elbow seam wrung itself. Now both bones are placed by TWO vectors --
+//    the bone axis and the elbow's hinge axis -- so the elbow bends exactly as
+//    the model was built to bend. The hinge is learned from the animation
+//    itself (whenever the stock pose bends an elbow, its axis is read in each
+//    part's own frame), so no model axes are assumed.
+//  * "the body is ahead of me when walking" (the cigarette effect: the body is
+//    this frame's Snake, the eye is last frame's) and "clipping into his
+//    body": the whole body is now anchored horizontally to the same head point
+//    the hands hang from, with the neck body_back_cm behind it. Render only.
+GameMatrix FromCols(V3 c0, V3 c1, V3 c2, V3 t) {
+    GameMatrix g{};
+    const V3 c[3] = { c0, c1, c2 };
+    for (int k = 0; k < 3; ++k) {
+        g.m[0][k] = Clamp16(c[k].x * 4096.0f); g.m[1][k] = Clamp16(c[k].y * 4096.0f); g.m[2][k] = Clamp16(c[k].z * 4096.0f);
+    }
+    SetT(g, t);
+    return g;
+}
+// world -> part-local direction: R^T v
+V3 ToLocal(const GameMatrix& g, V3 v) { return V3{ Dot(MatCol(g, 0), v), Dot(MatCol(g, 1), v), Dot(MatCol(g, 2), v) }; }
+V3 RotAxis(V3 v, V3 a, float ang) {   // Rodrigues, a unit
+    const float c = std::cos(ang), s = std::sin(ang);
+    return Add(Add(Mul(v, c), Mul(Cross(a, v), s)), Mul(a, Dot(a, v) * (1.0f - c)));
+}
+
+// Minimal re-aim (fallback until a hinge has been learned).
+GameMatrix AimPart(const GameMatrix& src, V3 from, V3 to, V3 newOrigin) {
+    GameMatrix g = src;
+    if (Norm(from) && Norm(to)) {
+        for (int c = 0; c < 3; ++c) {
+            const V3 v = RotateMinimal(MatCol(src, c), from, to, V3{ 0, 1, 0 });
+            g.m[0][c] = Clamp16(v.x * 4096.0f); g.m[1][c] = Clamp16(v.y * 4096.0f); g.m[2][c] = Clamp16(v.z * 4096.0f);
+        }
+    }
+    SetT(g, newOrigin);
+    return g;
+}
+
+// Place a part so its local bone axis bL lands on world b1 and its local hinge
+// hL on world n1. P = [b1 n1 b1xn1] * [bL hL bLxhL]^T.
+bool AlignPart(V3 bL, V3 hL, V3 b1, V3 n1, V3 origin, GameMatrix* out) {
+    if (!Norm(bL) || !Norm(b1)) return false;
+    hL = Sub(hL, Mul(bL, Dot(hL, bL))); if (!Norm(hL)) return false;
+    n1 = Sub(n1, Mul(b1, Dot(n1, b1))); if (!Norm(n1)) return false;
+    const V3 zL = Cross(bL, hL), z1 = Cross(b1, n1);
+    // column k of P = b1*bL[k] + n1*hL[k] + z1*zL[k]
+    const float bl[3] = { bL.x, bL.y, bL.z }, hl[3] = { hL.x, hL.y, hL.z }, zl[3] = { zL.x, zL.y, zL.z };
+    V3 col[3];
+    for (int k = 0; k < 3; ++k) col[k] = Add(Add(Mul(b1, bl[k]), Mul(n1, hl[k])), Mul(z1, zl[k]));
+    *out = FromCols(col[0], col[1], col[2], origin);
+    return true;
+}
+
+struct ArmHinge { bool learned = false; V3 up{}, fore{}; unsigned samples = 0; };
+ArmHinge h_hinge[2];
+float h_twistShare = 0.5f;       // [hands] forearm_twist_percent
+float h_bodyBack = 300.0f;       // [hands] body_back_cm, converted to game units
+float h_bodyDown = 0.0f;         // [hands] body_down_cm
+bool  h_bodyAnchor = true;       // [hands] body_follow_head
+int   h_fwdSign = 0;             // body forward = sign * cross(up, out), locked once
+unsigned h_anchorSkips = 0;
+
+// One arm: shoulder S (animated), target wrist T (controller hand).
+bool SolveArm(const GameMatrix* W, GameMatrix* out, int up, int fore, int hand, V3 T, V3 pole, int side,
+              const GameMatrix& handNew) {
+    const V3 S = MatT(W[up]), E0 = MatT(W[fore]), H0 = MatT(W[hand]);
+    const V3 u0 = Sub(E0, S), f0 = Sub(H0, E0);
+    const float a = Len(u0), b = Len(f0);
+    if (a < 1.0f || b < 1.0f) return false;
+
+    // Learn the elbow hinge whenever the animation bends this elbow.
+    {
+        V3 n0 = Cross(u0, f0);
+        const float sinBend = Len(n0) / (a * b);
+        if (sinBend > 0.26f && Norm(n0)) {          // > ~15 degrees
+            ArmHinge& hg = h_hinge[side];
+            const V3 lu = ToLocal(W[up], n0), lf = ToLocal(W[fore], n0);
+            if (!hg.learned) { hg.up = lu; hg.fore = lf; hg.learned = true;
+                DebugLogger::LogFormat("FullBody: %s elbow hinge learned from the animation (bend %.0f deg)",
+                    side ? "left" : "right", std::asin(std::fmin(1.0f, sinBend)) * 180.0f / kPi); }
+            else { hg.up = Add(Mul(hg.up, 0.95f), Mul(lu, 0.05f)); hg.fore = Add(Mul(hg.fore, 0.95f), Mul(lf, 0.05f));
+                   Norm(hg.up); Norm(hg.fore); }
+            ++hg.samples;
+        }
+    }
+
+    V3 d = Sub(T, S);
+    float L = Len(d);
+    if (!Norm(d)) return false;
+    V3 p = Sub(pole, Mul(d, Dot(pole, d)));
+    if (!Norm(p)) { p = Cross(d, V3{ 0, 1, 0 }); if (!Norm(p)) p = V3{ 1, 0, 0 }; }
+    V3 E;
+    if (L >= a + b - 0.5f) {
+        E = Add(S, Mul(d, L * a / (a + b)));        // straight, gap shared along the arm
+        ++h_ikOverReach;
+    }
+    else {
+        const float minL = std::fabs(a - b) + 1.0f;
+        if (L < minL) L = minL;
+        const float x = (a * a - b * b + L * L) / (2.0f * L);
+        const float h = std::sqrt(std::fmax(0.0f, a * a - x * x));
+        E = Add(Add(S, Mul(d, x)), Mul(p, h));
+    }
+    // Hinge of the solved arm. cross(upper, fore) = -h*L*cross(d, p), i.e.
+    // along cross(p, d) -- defined even when the arm is straight.
+    const V3 n1 = Cross(p, d);
+
+    const ArmHinge& hg = h_hinge[side];
+    bool aligned = false;
+    if (hg.learned) {
+        GameMatrix U{}, F{};
+        aligned = AlignPart(ToLocal(W[up], u0), hg.up, Sub(E, S), n1, S, &U) &&
+                  AlignPart(ToLocal(W[fore], f0), hg.fore, Sub(T, E), n1, E, &F);
+        if (aligned) {
+            // Share the hand's roll with the forearm: twist it about its own
+            // axis by part of the gap between the hand you hold and the hand
+            // the forearm would carry.
+            if (h_twistShare != 0.0f) {
+                V3 ax = Sub(T, E);
+                if (Norm(ax)) {
+                    // D = Hheld * Hcarried^T, Hcarried = Fnew * Wf^T * Wh;
+                    // apply D to a vector perpendicular to the forearm.
+                    V3 perp = n1; perp = Sub(perp, Mul(ax, Dot(perp, ax))); Norm(perp);
+                    const V3 inHandOld = ToLocal(W[hand], Add(Add(Mul(MatCol(W[fore], 0), ToLocal(F, perp).x),
+                        Mul(MatCol(W[fore], 1), ToLocal(F, perp).y)), Mul(MatCol(W[fore], 2), ToLocal(F, perp).z)));
+                    const V3 actual = Add(Add(Mul(MatCol(handNew, 0), inHandOld.x), Mul(MatCol(handNew, 1), inHandOld.y)),
+                        Mul(MatCol(handNew, 2), inHandOld.z));
+                    V3 ap = Sub(actual, Mul(ax, Dot(actual, ax)));
+                    if (Norm(ap)) {
+                        const float ang = std::atan2(Dot(Cross(perp, ap), ax), Dot(perp, ap)) * h_twistShare;
+                        F = FromCols(RotAxis(MatCol(F, 0), ax, ang), RotAxis(MatCol(F, 1), ax, ang),
+                                     RotAxis(MatCol(F, 2), ax, ang), E);
+                    }
+                }
+            }
+            out[up] = U; out[fore] = F;
+        }
+    }
+    if (!aligned) {
+        out[up] = AimPart(W[up], u0, Sub(E, S), S);
+        out[fore] = AimPart(W[fore], f0, Sub(T, E), E);
+    }
+    if (h_ikLogs < h_ikLogLines && (h_ikFrames % 90) == 0) {
+        ++h_ikLogs;
+        DebugLogger::LogFormat("FullBody[%u] %s arm: upper %.0f forearm %.0f (reach %.0f) | shoulder (%.0f,%.0f,%.0f) "
+            "-> hand (%.0f,%.0f,%.0f) dist %.0f%s | elbow (%.0f,%.0f,%.0f) %s | over-reach frames so far %u",
+            h_ikFrames, side ? "left" : "right", a, b, a + b, S.x, S.y, S.z, T.x, T.y, T.z, Len(Sub(T, S)),
+            Len(Sub(T, S)) > a + b ? " OUT OF REACH" : "", E.x, E.y, E.z,
+            aligned ? "hinge-aligned" : "minimal (hinge not learned yet)", h_ikOverReach);
+    }
+    return true;
+}
+
+// Whole body in its animated pose; anchored under the head; head + neck
+// folded away; arms solved.
+void FullBodyApply(const GameMatrix* Win, GameMatrix* out, int n) {
+    GameMatrix W[40];
+    for (int i = 0; i < n; ++i) W[i] = Win[i];
+    ++h_ikFrames;
+
+    const bool armsOk = h_upR >= 0 && h_upR < n && h_upL >= 0 && h_upL < n &&
+                        h_foreR < n && h_foreL < n && h_partR < n && h_partL < n;
+
+    // Body frame from the animation itself: "up" is the root part to the
+    // middle of the shoulders, "out" is shoulder to shoulder.
+    int root = 0;
+    for (int i = 0; i < n; ++i) if (h_parent[i] < 0) { root = i; break; }
+    V3 up{ 0, 1, 0 }, outR{ 1, 0, 0 };
+    V3 neck = MatT(W[root]);
+    if (armsOk) {
+        const V3 sR = MatT(W[h_upR]), sL = MatT(W[h_upL]);
+        neck = Mul(Add(sR, sL), 0.5f);
+        up = Sub(neck, MatT(W[root]));
+        if (!Norm(up)) up = V3{ 0, 1, 0 };
+        outR = Sub(sR, sL);
+        outR = Sub(outR, Mul(up, Dot(outR, up)));
+        if (!Norm(outR)) outR = V3{ 1, 0, 0 };
+    }
+    if (h_hidePartsN > 0 && h_hideParts[0] >= 0 && h_hideParts[0] < n) neck = MatT(W[h_hideParts[0]]);
+
+    // Anchor: neck body_back_cm behind the head point the hands hang from,
+    // horizontally (x/z); height stays the animation's (minus body_down_cm).
+    if (h_bodyAnchor && g_hf.haveHead && armsOk) {
+        V3 c = Cross(up, outR); c.y = 0.0f;
+        V3 fh = g_hf.fwd; fh.y = 0.0f;
+        if (Norm(c) && Norm(fh)) {
+            if (h_fwdSign == 0 && std::fabs(Dot(c, fh)) > 0.8f) {
+                h_fwdSign = Dot(c, fh) > 0 ? 1 : -1;
+                DebugLogger::LogFormat("FullBody: body forward locked (sign %d) -- neck kept %.0f units behind your head",
+                    h_fwdSign, h_bodyBack);
+            }
+            const V3 bodyFwd = Mul(c, (float)(h_fwdSign ? h_fwdSign : (Dot(c, fh) > 0 ? 1 : -1)));
+            const V3 target = Sub(g_hf.head, Mul(bodyFwd, h_bodyBack));
+            V3 delta{ target.x - neck.x, -h_bodyDown, target.z - neck.z };
+            const float dl = std::sqrt(delta.x * delta.x + delta.z * delta.z);
+            if (dl < 1500.0f) {
+                for (int i = 0; i < n; ++i) SetT(W[i], Add(MatT(W[i]), delta));
+                neck = Add(neck, delta);
+            }
+            else if (++h_anchorSkips <= 5)
+                DebugLogger::LogFormat("FullBody: anchor skipped -- body %.0f units from your head (camera elsewhere?)", dl);
+            if (h_ikLogs < h_ikLogLines && (h_ikFrames % 90) == 45) {
+                ++h_ikLogs;
+                DebugLogger::LogFormat("FullBody[%u] anchor: moved body by (%.0f,%.0f,%.0f) = %.0f units horizontally "
+                    "(animation vs head lead)", h_ikFrames, delta.x, delta.y, delta.z, dl);
+            }
+        }
+    }
+
+    for (int i = 0; i < n; ++i) out[i] = W[i];
+
+    // Head and neck: every vertex onto the base of the neck, a point.
+    if (h_hidePartsN > 0 && h_hideParts[0] >= 0 && h_hideParts[0] < n) {
+        GameMatrix z{};
+        SetT(z, MatT(W[h_hideParts[0]]));
+        for (int k = 0; k < h_hidePartsN; ++k)
+            if (h_hideParts[k] >= 0 && h_hideParts[k] < n) out[h_hideParts[k]] = z;
+    }
+    if (!armsOk) return;
+    const V3 down = Mul(up, -1.0f);
+
+    // A hand with no tracking keeps its animated arm and hand.
+    if (g_hf.haveR) {
+        out[h_partR] = g_hf.R;
+        SolveArm(W, out, h_upR, h_foreR, h_partR, MatT(g_hf.R), Add(down, Mul(outR, h_elbowOut)), 0, g_hf.R);
+    }
+    if (g_hf.haveL) {
+        out[h_partL] = g_hf.L;
+        SolveArm(W, out, h_upL, h_foreL, h_partL, MatT(g_hf.L), Add(down, Mul(outR, -h_elbowOut)), 1, g_hf.L);
+    }
+}
+
 void HandsApplyToScratch(uint32_t objs, int n) {
     GameMatrix* scratch = (GameMatrix*)(g_base + kPartWorldScratch);
     if (n > 40) n = 40;
     GameMatrix W[40];
     if (!SafeRead(W, scratch, sizeof(GameMatrix) * (size_t)n)) return;
+    if (h_fullBody) {
+        GameMatrix fb[40];
+        FullBodyApply(W, fb, n);
+        (void)objs;
+        SafeWrite(scratch, fb, sizeof(GameMatrix) * (size_t)n);   // scratch ONLY, never obj+0
+        return;
+    }
     const V3 anchorR = g_hf.haveR ? MatT(g_hf.R) : MatT(g_hf.L);
     const V3 anchorL = g_hf.haveL ? MatT(g_hf.L) : MatT(g_hf.R);
     GameMatrix out[40];
@@ -2094,8 +2429,13 @@ void ItemUseOnGameThread() {
 } // namespace
 
 // Runs before EVERY actor's act, on the game thread.
+// Crash report breadcrumbs (2026-10-05). The game actor whose act is running
+// right now (0 between acts), so a crash inside the game's own code can name
+// the actor it happened in. Two plain stores per act -- nothing else.
+volatile uint32_t g_crashActFn = 0, g_crashActWork = 0;
+
 extern "C" void __cdecl MotionAimActPre(uint32_t fn, uint32_t work) {
-    (void)work;
+    g_crashActFn = fn; g_crashActWork = work;
     h_actRehidObjs = 0;
     if (fn == (uint32_t)(g_base + kDgStartFrameActRva) || fn == (uint32_t)(g_base + kDgEndFrameActRva))
         RenderHidesPre();
@@ -2133,6 +2473,7 @@ extern "C" void __cdecl MotionAimActPre(uint32_t fn, uint32_t work) {
 // Runs after EVERY actor's act, on the game thread. Must stay cheap: one
 // compare against five addresses for everything that is not a gun.
 extern "C" void __cdecl MotionAimActPost(uint32_t fn, uint32_t work) {
+    g_crashActFn = 0; g_crashActWork = 0;
     if (ps_sightSaved != -1 && fn == (uint32_t)(g_base + kSightActRva)) {
         uint8_t cur = 0;
         if (SafeRead(&cur, (const void*)(g_base + kPlayerStatusB3Rva), 1)) {
@@ -2280,7 +2621,7 @@ extern "C" void __cdecl HandsScreenObjsWrap(uint32_t objs, int n) {
 
 // XR thread. The left controller's GRIP pose, stored exactly like the right
 // aim snapshot (play space + head-local), so the same builder can place it.
-void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
+static void PublishHandPoseInto(AimSnap& snap, VelTrackT& vt, HandEuro& eu, const XrPosef& grip, bool valid) {
     if (!g_anyInstalled) return;
     AcquireSRWLockExclusive(&g_lock);
     const bool haveHead = g_haveHead;
@@ -2288,10 +2629,10 @@ void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
     ReleaseSRWLockExclusive(&g_lock);
     if (!valid || !haveHead) {
         AcquireSRWLockExclusive(&g_lock);
-        g_snapL.valid = false; g_snapL.havePrev = false; g_snapL.haveWorld = false; g_snapL.haveFilt = false;
+        snap.valid = false; snap.havePrev = false; snap.haveWorld = false; snap.haveFilt = false;
         ReleaseSRWLockExclusive(&g_lock);
-        g_velTrackL.have = false;
-        g_euroL = HandEuro{};
+        vt.have = false;
+        eu = HandEuro{};
         return;
     }
     const XrQuaternionf inv = QInv(head.orientation);
@@ -2300,22 +2641,22 @@ void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
     const V3 pW = { grip.position.x - head.position.x, grip.position.y - head.position.y,
                     grip.position.z - head.position.z };
     const LONGLONG nowQ = NowQpc();
-    if (g_velTrackL.have) {
-        const float dt = (float)((double)(nowQ - g_velTrackL.qpc) / (double)g_qpcFreq);
+    if (vt.have) {
+        const float dt = (float)((double)(nowQ - vt.qpc) / (double)g_qpcFreq);
         if (dt > 0.002f && dt < 0.2f) {
             const float a = dt / (0.03f + dt);
-            const float raw[3] = { (grip.position.x - g_velTrackL.pos[0]) / dt,
-                                   (grip.position.y - g_velTrackL.pos[1]) / dt,
-                                   (grip.position.z - g_velTrackL.pos[2]) / dt };
-            for (int i = 0; i < 3; ++i) g_velTrackL.vel[i] += (raw[i] - g_velTrackL.vel[i]) * a;
+            const float raw[3] = { (grip.position.x - vt.pos[0]) / dt,
+                                   (grip.position.y - vt.pos[1]) / dt,
+                                   (grip.position.z - vt.pos[2]) / dt };
+            for (int i = 0; i < 3; ++i) vt.vel[i] += (raw[i] - vt.vel[i]) * a;
         }
     }
-    g_velTrackL.have = true; g_velTrackL.qpc = nowQ;
-    g_velTrackL.pos[0] = grip.position.x; g_velTrackL.pos[1] = grip.position.y; g_velTrackL.pos[2] = grip.position.z;
+    vt.have = true; vt.qpc = nowQ;
+    vt.pos[0] = grip.position.x; vt.pos[1] = grip.position.y; vt.pos[2] = grip.position.z;
     const V3 dL = QRot(inv, dW), pL = QRot(inv, pW), uL = QRot(inv, uW);
-    const V3 vL = QRot(inv, V3{ g_velTrackL.vel[0], g_velTrackL.vel[1], g_velTrackL.vel[2] });
+    const V3 vL = QRot(inv, V3{ vt.vel[0], vt.vel[1], vt.vel[2] });
     AcquireSRWLockExclusive(&g_lock);
-    AimSnap& s = g_snapL;
+    AimSnap& s = snap;
     if (s.valid) {
         s.havePrev = true;
         for (int i = 0; i < 3; ++i) { s.pdir[i] = s.dir[i]; s.ppos[i] = s.pos[i]; s.pup[i] = s.up[i]; }
@@ -2326,15 +2667,31 @@ void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
     s.wdir[0] = dW.x; s.wdir[1] = dW.y; s.wdir[2] = dW.z;
     s.wup[0] = uW.x;  s.wup[1] = uW.y;  s.wup[2] = uW.z;
     s.wpos[0] = grip.position.x; s.wpos[1] = grip.position.y; s.wpos[2] = grip.position.z;
-    s.wvel[0] = g_velTrackL.vel[0]; s.wvel[1] = g_velTrackL.vel[1]; s.wvel[2] = g_velTrackL.vel[2];
+    s.wvel[0] = vt.vel[0]; s.wvel[1] = vt.vel[1]; s.wvel[2] = vt.vel[2];
     s.dir[0] = dL.x; s.dir[1] = dL.y; s.dir[2] = dL.z;
     s.up[0] = uL.x;  s.up[1] = uL.y;  s.up[2] = uL.z;
     s.pos[0] = pL.x; s.pos[1] = pL.y; s.pos[2] = pL.z;
     s.vel[0] = vL.x; s.vel[1] = vL.y; s.vel[2] = vL.z;
     s.valid = true;
     s.qpc = nowQ;
-    FilterIntoSnap(g_euroL, s, V3{ grip.position.x, grip.position.y, grip.position.z }, dW, uW, head, nowQ);
+    FilterIntoSnap(eu, s, V3{ grip.position.x, grip.position.y, grip.position.z }, dW, uW, head, nowQ);
     ReleaseSRWLockExclusive(&g_lock);
+}
+
+void MotionAimPublishLeftGrip(const XrPosef& grip, bool valid) {
+    PublishHandPoseInto(g_snapL, g_velTrackL, g_euroL, grip, valid);
+}
+
+void MotionAimPublishRightHandAim(const XrPosef& aim, bool valid) {
+    PublishHandPoseInto(g_snapRH, g_velTrackRH, g_euroRH, aim, valid);
+}
+
+void MotionAimSetLeftHanded(bool leftHanded) {
+    if (g_leftHanded != leftHanded)
+        DebugLogger::LogFormat("Hands: %s", leftHanded
+            ? "LEFT-HANDED -- the gun follows your left hand; Snake's hands stay on their own controllers"
+            : "right-handed");
+    g_leftHanded = leftHanded;
 }
 
 bool IsGunInHandActive() {
@@ -2524,6 +2881,29 @@ void LoadMotionAimConfig() {
         h_knockPower = HI("knock_noise_power", 100);
         h_knockLength = HI("knock_noise_length", 16);
         h_logLines = HI("log_lines", 40);
+        h_fullBody = HI("full_body", 0) != 0;   // experimental: off unless asked for
+        {
+            char buf[96] = {};
+            GetPrivateProfileStringA(H, "full_body_hide_parts", "5,6", buf, sizeof(buf), ini.c_str());
+            h_hidePartsN = 0;
+            for (char* p = buf; *p && h_hidePartsN < 8; ) {
+                char* end = nullptr;
+                const long v = strtol(p, &end, 10);
+                if (end == p) { ++p; continue; }
+                h_hideParts[h_hidePartsN++] = (int)v;
+                p = end;
+            }
+        }
+        h_elbowOut = (float)HI("elbow_out_percent", 50) / 100.0f;
+        h_ikLogLines = HI("full_body_log_lines", 12);
+        h_twistShare = (float)HI("forearm_twist_percent", 50) / 100.0f;
+        h_bodyAnchor = HI("body_follow_head", 1) != 0;
+        h_bodyBack = (float)HI("body_back_cm", 15) * g_cfgUnitsPerMetre / 100.0f;
+        h_bodyDown = (float)HI("body_down_cm", 0) * g_cfgUnitsPerMetre / 100.0f;
+        DebugLogger::LogFormat("FullBody config: full_body=%d hide %d part(s) starting %d, elbow_out=%.0f%% "
+            "forearm_twist=%.0f%% body_follow_head=%d back %.0f units down %.0f units",
+            h_fullBody ? 1 : 0, h_hidePartsN, h_hidePartsN ? h_hideParts[0] : -1, h_elbowOut * 100.0f,
+            h_twistShare * 100.0f, h_bodyAnchor ? 1 : 0, h_bodyBack, h_bodyDown);
         DebugLogger::LogFormat("Hands config: enabled=%d forearms=%d parts R%d/L%d (forearms %d/%d) rotR(%.0f,%.0f,%.0f) "
             "rotL(%.0f,%.0f,%.0f) | wall_collision=%d gun_collision=%d margin=%.0f gun_length=%.0f | knock=%d "
             "min %.2f m/s cooldown %dms sound %s noise %d/%d",
@@ -2721,4 +3101,22 @@ bool MotionAimHandTouchingWall(int side) {
     const int h = (side == 1) ? 0 : 1;
     const unsigned long long t = h_touchTick[h].load(std::memory_order_relaxed);
     return t != 0 && GetTickCount64() - t < 150;
+}
+
+// Crash handler (dllmain.cpp): the DG_OBJS pointers this file writes to, and
+// how long ago each was last confirmed, read without locks or allocation.
+// Called from inside an exception handler, so it only copies plain values.
+extern "C" void MotionAimCrashSnapshot(MotionAimCrashInfo* out) {
+    if (!out) return;
+    out->actFn = g_crashActFn;
+    out->actWork = g_crashActWork;
+    out->handsActive = g_hf.active ? 1 : 0;
+    out->handsBodyObjs = g_hf.bodyObjs;
+    out->handsNParts = g_hf.nParts;
+    out->handsAgeMs = g_hf.qpc ? MsSince(g_hf.qpc) : -1.0;
+    out->unhidObjs = h_unhidObjs;
+    out->unhidAgeMs = h_unhideQpc ? MsSince(h_unhideQpc) : -1.0;
+    out->renderHid0 = rh_hid[0];
+    out->renderHid1 = rh_hid[1];
+    out->actRehidObjs = h_actRehidObjs;
 }

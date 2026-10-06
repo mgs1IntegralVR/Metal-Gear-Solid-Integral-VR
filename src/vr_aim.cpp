@@ -1774,12 +1774,17 @@ bool GazeShows(int side, const XrPosef& head, const XrPosef& quadPose) {
 
 } // namespace
 
+// Left-handed mode ([input] left_handed, set by vr_input.cpp). Snake's hand
+// models stay on their own controllers; only the gun moves to the left hand
+// (motion_aim.cpp). The wrist panels stay on the physical wrists.
+void SetLeftHandedHands(bool leftHanded) { MotionAimSetLeftHanded(leftHanded); }
+
 void PublishControllerGrips(const XrPosef& left, bool leftValid, const XrPosef& right, bool rightValid,
                             bool leftGripHeld, bool rightGripHeld) {
     w_grip[0] = left;  w_gripValid[0] = leftValid;
     w_grip[1] = right; w_gripValid[1] = rightValid;
     w_gripHeld[0] = leftGripHeld; w_gripHeld[1] = rightGripHeld;
-    MotionAimPublishLeftGrip(left, leftValid);   // Snake's left hand ([hands])
+    MotionAimPublishLeftGrip(left, leftValid);   // Snake's left hand ([hands]), in either handedness
 }
 
 void LoadWristHudConfig() {

@@ -26,8 +26,8 @@ To uninstall, delete those three files and rename `dinput.dll.bak` back to `dinp
 
 - **R3 double-press**: switch between VR and the original game on a virtual screen
 - **R3 hold**: recentre
-- **L3 hold**: in-headset button remapping on your left wrist
-- Everything else is listed and remappable in `[controls]` of `mgs1_vr_config.ini`.
+- **L3 hold**: **VR Settings** panel, in game, in the pause menu or on the title screen. Change view, comfort, HUD, hand and button options without leaving the headset; most apply instantly and every change is saved to `mgs1_vr_config.ini`. (Triggers switch tabs, stick picks and changes, Y resets an option, B closes.)
+- Everything is also listed in `mgs1_vr_config.ini`, with full documentation.
 
 ## Build (developers)
 

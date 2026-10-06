@@ -1,0 +1,97 @@
+## WORKSPACE EXECUTIVE SUMMARY (YAML)
+# Generated: 2026-10-05T20:20:00.5376519-07:00
+# Root: C:\Users\Conor\source\repos\MGS1-Integral-VR-repo
+Architecture:
+  Type: General Codebase
+  Scale: 45 relevant source files
+  Components: 0
+  Controllers: 0
+  Models: 0
+  Services: 0
+---
+- File: mgs1-vr-mod.slnx
+  Preview: "<Solution>  <Configurations>   <Platform Name='x64' />   <Platform Name='x86' />  </Configurations>  <Project Path='mgs1-vr-mod.vcxproj' Id='d78671d9-..."
+- File: README.md
+  Preview: "# Metal Gear Solid Integral VR A VR mod for the **GOG PC release of Metal Gear Solid (Integral)**. It hooks the original `mgsi.exe` and renders the ga..."
+- File: include\camera_write_hook.h
+  Preview: "#pragma once #include <cstdint> // --------------------------------------------------------------------------- // In-frame camera hooks. // // TWO det..."
+- File: include\crash_report.h
+  Preview: "#pragma once #include <cstdint> // Crash report (2026-10-05). dllmain.cpp installs the handler; motion_aim.cpp // fills in the DG_OBJS pointers it wri..."
+- File: include\d3d9_capture_hook.h
+  Preview: "#pragma once #include <cstdint> #include <vector> using VRFrameTickFn = void(*)(); // This GOG release's DDRAW.dll is GOG's own 'Direct1-7 wrapper': i..."
+- File: include\ddraw_hook.h
+  Preview: "#pragma once #include <cstdint> #include <vector> using VRFrameTickFn = void(*)(); bool InstallDdrawHooks(VRFrameTickFn onFrameTick); // Copies the mo..."
+- File: include\debug_logging.h
+  Preview: "#pragma once #include <windows.h> #include <fstream> #include <sstream> #include <chrono> #include <mutex> #include <string> #include <cstdarg> #inclu..."
+- File: include\gpu_eye_capture.h
+  Preview: "#pragma once #include <cstdint> struct RtEyeImage; // --------------------------------------------------------------------------- // GPU EYE CAPTURE (..."
+- File: include\mgs_structs.h
+  Preview: " #pragma once #include <cstdint> #pragma pack(push, 1) // MGS1 / PSX Vector representation (Fixed-point millimeters) struct MGS_SVECTOR {   int32_t x;..."
+- File: include\motion_aim.h
+  Preview: "#pragma once // --------------------------------------------------------------------------- // MOTION AIM -- bullets leave your right hand and go wher..."
+- File: include\offsets.h
+  Preview: "#pragma once #include <cstdint> // ======================================================================== // MGS1 (mgsi.exe) Memory Offsets & Signat..."
+- File: include\render_twice.h
+  Preview: "#pragma once #include <cstdint> // --------------------------------------------------------------------------- // RENDER TWICE -- true stereo, both ey..."
+- File: include\vr_aim.h
+  Preview: "#pragma once // --------------------------------------------------------------------------- // MOTION AIM: controller pose publishing + the OpenXR aim..."
+- File: include\vr_settings.h
+  Preview: "#pragma once // --------------------------------------------------------------------------- // IN-GAME VR SETTINGS PANEL (2026-10-05). // // Hold L3 (..."
+- File: src\camera_write_hook.cpp
+  Preview: "#include <windows.h> #include <cstdint> #include <cstring> #include <cstdio> #include <cmath> #include <cstdlib> #include <atomic> #include <string> #..."
+- File: src\d3d9_capture_hook.cpp
+  Preview: "#include <windows.h> #include <d3d9.h> #include <cstring>  // memcpy, used by the depth-stencil probe #include <mutex> #include <vector> #include 'Min..."
+- File: src\ddraw_hook.cpp
+  Preview: "#include <windows.h> #include <ddraw.h> #include <mutex> #include <condition_variable> #include <thread> #include <atomic> #include <intrin.h> #includ..."
+- File: src\debug_logging.cpp
+  Preview: "#include '../include/debug_logging.h' // Static member initialization std::ofstream DebugLogger::logFile; std::mutex DebugLogger::logMutex; bool Debug..."
+- File: src\dllmain.cpp
+  Preview: "#include <windows.h> #define INITGUID // so GUID_SysKeyboard (used below) is actually defined, not just declared #include <dinput.h> #include <xinput...."
+- File: src\gpu_eye_capture.cpp
+  Preview: "#include <windows.h> #include <d3d9.h> #include <atomic> #include <cstdio> #include <cstring> #include <mutex> #include <vector> #include 'MinHook.h' ..."
+- File: src\motion_aim.cpp
+  Preview: "#include <windows.h> #include <cmath> #include <cstdint> #include <cstring> #include <cstdlib> #include <cstdio> #include <atomic> #include <string> #..."
+- File: src\render_twice.cpp
+  Preview: "#include <windows.h> #include <atomic> #include <cmath> #include <cstddef> #include <cstdio> #include <cstdint> #include <cstring> #include <string> #..."
+- File: src\vr_aim.cpp
+  Preview: "#include <windows.h> #include <algorithm> #include <cmath> #include <cstdint> #include <cstdio> #include <cstring> #include <cstdlib> #include <atomic..."
+- File: src\vr_injection.cpp
+  Preview: "#include <windows.h> #include <cstdint> #include <cmath> #include <string> #include <cstring> #include <vector> #include <mutex> #include <atomic> #in..."
+- File: src\vr_input.cpp
+  Preview: "#include <windows.h> #include <cmath> #include <cstdio>  // sprintf_s, used by the keyboard-synthesis coverage log #include <string> #include <atomic>..."
+- File: src\vr_settings.cpp
+  Preview: "#include <windows.h> #include <algorithm> #include <atomic> #include <cmath> #include <cstdint> #include <cstdio> #include <cstring> #include <string>..."
+- File: third-party\minhook\LICENSE.txt
+  Preview: "MinHook - The Minimalistic API Hooking Library for x64/x86 Copyright (C) 2009-2017 Tsuda Kageyu. All rights reserved. Redistribution and use in source..."
+- File: third-party\minhook\include\MinHook.h
+  Preview: "/* * MinHook - The Minimalistic API Hooking Library for x64/x86 * Copyright (C) 2009-2017 Tsuda Kageyu. * All rights reserved. * * Redistribution and ..."
+- File: third-party\minhook\src\buffer.h
+  Preview: "/* * MinHook - The Minimalistic API Hooking Library for x64/x86 * Copyright (C) 2009-2017 Tsuda Kageyu. * All rights reserved. * * Redistribution and ..."
+- File: third-party\minhook\src\trampoline.h
+  Preview: "/* * MinHook - The Minimalistic API Hooking Library for x64/x86 * Copyright (C) 2009-2017 Tsuda Kageyu. * All rights reserved. * * Redistribution and ..."
+- File: third-party\openxr\LICENSES\Apache-2.0.txt
+  Preview: "Apache License Version 2.0, January 2004 http://www.apache.org/licenses/ TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION   1. Definitions..."
+- File: third-party\minhook\src\hde\hde32.h
+  Preview: "/* * Hacker Disassembler Engine 32 * Copyright (c) 2006-2009, Vyacheslav Patkov. * All rights reserved. * * hde32.h: C/C++ header file * */ #ifndef _H..."
+- File: third-party\minhook\src\hde\hde64.h
+  Preview: "/* * Hacker Disassembler Engine 64 * Copyright (c) 2008-2009, Vyacheslav Patkov. * All rights reserved. * * hde64.h: C/C++ header file * */ #ifndef _H..."
+- File: third-party\minhook\src\hde\pstdint.h
+  Preview: "/* * MinHook - The Minimalistic API Hooking Library for x64/x86 * Copyright (C) 2009-2017 Tsuda Kageyu. All rights reserved. * * Redistribution and us..."
+- File: third-party\minhook\src\hde\table32.h
+  Preview: "/* * Hacker Disassembler Engine 32 C * Copyright (c) 2008-2009, Vyacheslav Patkov. * All rights reserved. * */ #define C_NONE  0x00 #define C_MODRM  0..."
+- File: third-party\minhook\src\hde\table64.h
+  Preview: "/* * Hacker Disassembler Engine 64 C * Copyright (c) 2008-2009, Vyacheslav Patkov. * All rights reserved. * */ #define C_NONE  0x00 #define C_MODRM  0..."
+- File: third-party\openxr\include\openxr\openxr.h
+  Preview: "#ifndef OPENXR_H_ #define OPENXR_H_ 1 /* ** Copyright 2017-2024, The Khronos Group Inc. ** ** SPDX-License-Identifier: Apache-2.0 OR MIT */ /* ** This..."
+- File: third-party\openxr\include\openxr\openxr_loader_negotiation.h
+  Preview: "#ifndef OPENXR_LOADER_NEGOTIATION_H_ #define OPENXR_LOADER_NEGOTIATION_H_ 1 /* ** Copyright 2017-2024, The Khronos Group Inc. ** ** SPDX-License-Ident..."
+- File: third-party\openxr\include\openxr\openxr_platform.h
+  Preview: "#ifndef OPENXR_PLATFORM_H_ #define OPENXR_PLATFORM_H_ 1 /* ** Copyright 2017-2024, The Khronos Group Inc. ** ** SPDX-License-Identifier: Apache-2.0 OR..."
+- File: third-party\openxr\include\openxr\openxr_platform_defines.h
+  Preview: "/* ** Copyright (c) 2017-2024, The Khronos Group Inc. ** ** SPDX-License-Identifier: Apache-2.0 OR MIT */ #ifndef OPENXR_PLATFORM_DEFINES_H_ #define O..."
+- File: third-party\openxr\include\openxr\openxr_reflection.h
+  Preview: "#ifndef OPENXR_REFLECTION_H_ #define OPENXR_REFLECTION_H_ 1 /* ** Copyright (c) 2017-2024, The Khronos Group Inc. ** ** SPDX-License-Identifier: Apach..."
+- File: third-party\openxr\include\openxr\openxr_reflection_parent_structs.h
+  Preview: "#ifndef OPENXR_REFLECTION_PARENT_STRUCTS_H_ #define OPENXR_REFLECTION_PARENT_STRUCTS_H_ 1 /* ** Copyright (c) 2017-2024, The Khronos Group Inc. ** ** ..."
+- File: third-party\openxr\include\openxr\openxr_reflection_structs.h
+  Preview: "#ifndef OPENXR_REFLECTION_STRUCTS_H_ #define OPENXR_REFLECTION_STRUCTS_H_ 1 /* ** Copyright (c) 2017-2024, The Khronos Group Inc. ** ** SPDX-License-I..."
